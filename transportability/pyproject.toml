@@ -11,7 +11,7 @@ dependencies = [
 	"pandas",
 	"polars",
 	"pydeseq2",
-	"scanpy",
+	"scanpy>=1.10",
 	"scikit-learn",
 	"scipy",
 ]
@@ -31,7 +31,7 @@ url = "https://packagefeedproxy.microsoft.io/pypi/simple/"
 default = true
 
 [project.urls]
-repository = "https://github.com/health-futures/cellular_perturbations"
+repository = "https://github.com/microsoft/mechanisms_matter"
 
 [project.scripts]
 
