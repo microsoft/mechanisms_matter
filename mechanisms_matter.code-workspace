@@ -1,0 +1,12 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        "terminal.integrated.env.osx": {
+            "PIP_INDEX_URL": "https://packagefeedproxy.microsoft.io/pypi/simple/"
+        }
+    }
+}

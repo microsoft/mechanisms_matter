@@ -1,0 +1,39 @@
+{
+    "build": {
+        "dockerfile": "../Dockerfile",
+        "context": "../.."
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/docker-in-docker": {}
+    },
+    "runArgs": [
+        "--gpus=all",
+        "--shm-size=4gb"
+    ],
+    "hostRequirements": {
+        "gpu": "required"
+    },
+    "remoteEnv": {
+        "WANDB_API_KEY": "${localEnv:WANDB_API_KEY}",
+        "WANDB_BASE_URL": "${localEnv:WANDB_BASE_URL}"
+    },
+    "mounts": [
+        "source=${localEnv:HOME},target=/mnt/home,type=bind,consistency=cached"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.debugpy",
+                "ms-toolsai.jupyter",
+                "charliermarsh.ruff",
+                "eamodio.gitlens",
+                "redhat.vscode-yaml",
+                "bierner.github-markdown-preview",
+                "GitHub.copilot",
+                "GitHub.vscode-pull-request-github"
+            ]
+        }
+    }
+}
