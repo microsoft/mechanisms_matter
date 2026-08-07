@@ -14,25 +14,6 @@ dependencies = [
 	"scanpy",
 	"scikit-learn",
 	"scipy",
-	"rats-apps",
-	"scvi-tools",
-	"torch",
-	"pytorch-lightning",
-	"scikit-misc",
-	"igraph",
-	"leidenalg",
-	"scib",
-	"scib-metrics",
-	"torchvision",
-	"wandb",
-	"nbformat",
-	"torch-geometric",
-	"geomloss",
-	"transformers",
-	"omegaconf",
-	"pot",
-	"ema-pytorch",
-	"torchdiffeq",
 ]
 
 [dependency-groups]
@@ -41,24 +22,13 @@ dev = [
 	"pyright",
 	"pytest",
 	"pytest-cov",
-	"pytest-nunit",
 	"ruff",
-	"types-urllib3",
 ]
-
-[tool.uv.sources]
-torch = [{ index = "torch-cuda130" }]
-torchvision = [{ index = "torch-cuda130" }]
 
 [[tool.uv.index]]
 name = "microsoft-pypi"
 url = "https://packagefeedproxy.microsoft.io/pypi/simple/"
 default = true
-
-[[tool.uv.index]]
-name = "torch-cuda130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
 
 [project.urls]
 repository = "https://github.com/health-futures/cellular_perturbations"
