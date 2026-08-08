@@ -30,4 +30,3 @@ updates:
     commit-message:
       prefix: ":arrow_up: dep-bump"
       include: scope
-    open-pull-requests-limit: 10
