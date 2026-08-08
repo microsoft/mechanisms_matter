@@ -67,6 +67,7 @@ jobs:
   codeql:
     name: CodeQL
     runs-on: ubuntu-latest
+    if: false # re-enable once GHAS is available on this repo
     permissions:
       actions: read
       contents: read
