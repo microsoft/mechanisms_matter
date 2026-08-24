@@ -23,7 +23,7 @@ def pds(
     """
     if log_fold:
         X_obs = np.log2(X_obs + eps)
-        X_pred = np.log2(X_pred + eps) - reference
+        X_pred = np.log2(X_pred + eps)
         reference = np.log2(reference + eps)
 
     true_effects = X_obs - reference
