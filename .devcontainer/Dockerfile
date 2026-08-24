@@ -2,6 +2,8 @@ FROM mcr.microsoft.com/mirror/docker/library/ubuntu:24.04
 
 ENV PROJECT_NAME=scaling_laws_perturbations
 ENV PROJECT_PATH=/workspaces/$PROJECT_NAME
+ENV PIP_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple/
+ENV UV_DEFAULT_INDEX=https://packagefeedproxy.microsoft.io/pypi/simple/
 
 WORKDIR $PROJECT_PATH
 
