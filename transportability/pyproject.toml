@@ -7,13 +7,25 @@ requires-python = ">=3.10,<3.15"
 authors = []
 dependencies = [
 	"anndata",
+	"ema-pytorch",
+	"fair-esm",
+	"geomloss",
 	"numpy",
+	"omegaconf",
 	"pandas",
+	"peft",
 	"polars",
+	"pot",
 	"pydeseq2",
+	"requests",
 	"scanpy>=1.10",
 	"scikit-learn",
 	"scipy",
+	"scvi-tools",
+	"torch",
+	"torch-geometric",
+	"transformers",
+	"wandb",
 ]
 
 [dependency-groups]

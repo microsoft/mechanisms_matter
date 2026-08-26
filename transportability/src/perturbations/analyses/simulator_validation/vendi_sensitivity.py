@@ -1,0 +1,554 @@
+r"""
+Vendi diversity-score sensitivity to dataset size and noise.
+
+Sweeps the perturbation-level Vendi score across (a) cell-subsampling fractions
+and (b) injected noise levels, with repeated seeds, to characterize when the
+diversity-aware metric is stable. This addresses the reviewer question of how
+sensitive the diversity metric is to dataset size and noise.
+
+Example:
+    python -m perturbations.analyses.simulator_validation.vendi_sensitivity \\
+        --name norman19 \\
+        --dataset-path data/norman19/norman19_processed.h5ad \\
+        --output-dir results/vendi_sensitivity
+"""
+
+# pyright: reportUnknownMemberType=false
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import anndata as ad
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+from perturbations.analyses.common import NORM_LAYER_KEY
+from perturbations.analyses.util import ensure_normalized_log1p_layer, load_real_dataset
+from perturbations.metrics.reconstruction.distance_util import estimate_mmd_gamma
+from perturbations.metrics.reconstruction.vendi_score import (
+    estimate_vendi_outer_sigma_squared,
+    estimate_vendi_pseudobulk_sigma_squared,
+    fit_vendi_pseudobulk_pca,
+    vendi_score,
+    vendi_score_pseudobulk,
+)
+from perturbations.util.anndata_util import fit_control_incremental_pca
+
+_DEFAULT_OUTPUT_DIR = "results/vendi_sensitivity"
+
+
+def _parse_float_list(text: str) -> list[float]:
+    """Parse a comma-separated list of floats."""
+    return [float(x) for x in text.split(",") if x.strip() != ""]
+
+
+def _compute_vendi(
+    adata: ad.AnnData,
+    lognorm_layer: str,
+    control_label: str,
+    n_pca_components: int,
+    seed: int,
+    pca_model: object,
+    gamma: float,
+    outer_sigma_squared: float,
+) -> float:
+    """Compute the perturbation-level Vendi score for one dataset."""
+    return float(
+        vendi_score(
+            ac=adata,
+            n_pca_components=n_pca_components,
+            layer_key=lognorm_layer,
+            control_label=control_label,
+            random_state=seed,
+            gamma=gamma,
+            pca_model=pca_model,
+            outer_sigma_squared=outer_sigma_squared,
+        )
+    )
+
+
+def _pseudobulk_matrix(
+    adata: ad.AnnData,
+    lognorm_layer: str,
+    control_label: str,
+) -> tuple[np.ndarray, int | None]:
+    """Return ordered perturbation means and the optional control-row index."""
+    labels = np.asarray(adata.obs["perturbation"])
+    unique_labels = sorted(np.unique(labels).tolist())
+    matrix = adata.layers[lognorm_layer]
+
+    means: list[np.ndarray] = []
+    control_idx: int | None = None
+    for i, label in enumerate(unique_labels):
+        mask = labels == label
+        mean = matrix[mask, :].mean(axis=0)
+        means.append(np.asarray(mean, dtype=np.float64).ravel())
+        if control_label is not None and label == control_label:
+            control_idx = i
+
+    return np.vstack(means), control_idx
+
+
+def _compute_vendi_pseudobulk(
+    adata: ad.AnnData,
+    lognorm_layer: str,
+    control_label: str,
+    pca_model: object,
+    outer_sigma_squared: float,
+) -> float:
+    """Compute pseudobulk Vendi using a fixed observed reference."""
+    pseudobulk, control_idx = _pseudobulk_matrix(adata, lognorm_layer, control_label)
+    return float(
+        vendi_score_pseudobulk(
+            pseudobulk,
+            control_idx=control_idx,
+            pca_model=pca_model,
+            outer_sigma_squared=outer_sigma_squared,
+        )
+    )
+
+
+def _compute_vendi_both(
+    adata: ad.AnnData,
+    lognorm_layer: str,
+    control_label: str,
+    n_pca_components: int,
+    seed: int,
+    pca_model: object,
+    gamma: float,
+    outer_sigma_squared: float,
+    pseudobulk_pca_model: object | None,
+    pseudobulk_sigma_squared: float | None,
+) -> tuple[float, float]:
+    """Compute both cell-level and pseudobulk Vendi scores, returning NaN on failure."""
+    try:
+        cell = _compute_vendi(
+            adata,
+            lognorm_layer,
+            control_label,
+            n_pca_components,
+            seed,
+            pca_model,
+            gamma,
+            outer_sigma_squared,
+        )
+    except (ValueError, KeyError):
+        cell = float("nan")
+    try:
+        pseudobulk = _compute_vendi_pseudobulk(
+            adata,
+            lognorm_layer,
+            control_label,
+            pseudobulk_pca_model,
+            pseudobulk_sigma_squared,
+        )
+    except (ValueError, KeyError):
+        pseudobulk = float("nan")
+    return cell, pseudobulk
+
+
+def _subsample_cells(adata: ad.AnnData, fraction: float, rng: np.random.Generator) -> ad.AnnData:
+    """Return a random cell subsample at the given fraction."""
+    if fraction >= 1.0:
+        return adata
+    n_keep = max(1, round(adata.n_obs * fraction))
+    idx = rng.choice(adata.n_obs, size=n_keep, replace=False)
+    return adata[np.sort(idx), :].copy()
+
+
+def _inject_noise(
+    adata: ad.AnnData,
+    lognorm_layer: str,
+    noise_type: str,
+    level: float,
+    rng: np.random.Generator,
+    counts_layer: str = "counts",
+    dropout_space: str = "counts",
+    control_label: str | None = None,
+    noise_target: str = "all",
+    gaussian_standard_noise: np.ndarray | None = None,
+    gaussian_gene_std: np.ndarray | None = None,
+    clip_gaussian_nonnegative: bool = True,
+) -> ad.AnnData:
+    """
+    Return a copy of ``adata`` with noise added.
+
+    ``"dropout"`` zeros a fraction ``level`` of stored expression entries.
+    With ``dropout_space="counts"`` (default) the entries are dropped in the raw
+    ``counts_layer`` and the log-normalized layer is recomputed, so surviving
+    genes are renormalized to the reduced library size. With
+    ``dropout_space="log"`` the entries are zeroed directly in the
+    log-normalized layer (no renormalization).
+
+    ``"gaussian"`` adds zero-mean Gaussian noise scaled to each gene's own
+    variability: the per-gene standard deviation is ``level * std_g``. ``level``
+    is therefore a dimensionless noise-to-signal ratio (alpha) that is comparable
+    across datasets; ``alpha=1`` means the injected noise std equals each gene's
+    signal std (i.e. half the total variance becomes noise).
+    Supplying ``gaussian_standard_noise`` and ``gaussian_gene_std`` reuses one
+    nested noise realization across levels. ``clip_gaussian_nonnegative`` should
+    be disabled for signed latent feature spaces.
+
+    ``noise_target="perturbed"`` restricts the noise to non-control cells
+    (``obs['perturbation'] != control_label``); ``"all"`` noises every cell.
+    """
+    if level <= 0.0:
+        return adata
+
+    out = adata.copy()
+
+    if noise_target == "perturbed":
+        if control_label is None:
+            raise ValueError("control_label is required when noise_target='perturbed'.")
+        row_mask = np.asarray(out.obs["perturbation"]) != control_label
+    else:
+        row_mask = np.ones(out.n_obs, dtype=bool)
+
+    if noise_type == "dropout":
+        target_layer = counts_layer if dropout_space == "counts" else lognorm_layer
+        if target_layer not in out.layers:
+            raise KeyError(
+                f"dropout target layer {target_layer!r} not found. "
+                + f"Available layers: {list(out.layers.keys())}"
+            )
+        matrix = out.layers[target_layer]
+        csr = matrix.tocsr().copy() if sparse.issparse(matrix) else sparse.csr_matrix(matrix)
+        # Only drop entries that belong to targeted rows.
+        entry_row = np.repeat(np.arange(csr.shape[0]), np.diff(csr.indptr))
+        entry_targeted = row_mask[entry_row]
+        keep = (rng.random(csr.data.shape[0]) >= level) | (~entry_targeted)
+        csr.data = csr.data * keep
+        csr.eliminate_zeros()
+        out.layers[target_layer] = csr
+
+        if dropout_space == "counts":
+            # Recompute the log-normalized layer so survivors renormalize to the
+            # reduced library size.
+            if lognorm_layer in out.layers:
+                del out.layers[lognorm_layer]
+            ensure_normalized_log1p_layer(
+                out, output_layer_key=lognorm_layer, source_layer=counts_layer
+            )
+    elif noise_type == "gaussian":
+        matrix = out.layers[lognorm_layer]
+        dense = (
+            matrix.toarray() if sparse.issparse(matrix) else np.asarray(matrix, dtype=np.float64)
+        )
+        # Scale noise to each gene's own variability: sigma_g = level * std_g,
+        # so `level` is a dimensionless noise-to-signal ratio (alpha) comparable
+        # across datasets. alpha=1 => noise std equals signal std per gene.
+        gene_std = (
+            dense.std(axis=0, keepdims=True)
+            if gaussian_gene_std is None
+            else np.asarray(gaussian_gene_std, dtype=np.float64)
+        )
+        standard_noise = (
+            rng.standard_normal(size=dense.shape)
+            if gaussian_standard_noise is None
+            else np.asarray(gaussian_standard_noise, dtype=np.float64)
+        )
+        if standard_noise.shape != dense.shape:
+            raise ValueError(
+                "gaussian_standard_noise must match the selected layer shape. "
+                + f"Got {standard_noise.shape} and {dense.shape}."
+            )
+        noise = standard_noise * (level * gene_std)
+        noise[~row_mask, :] = 0.0
+        dense = dense + noise
+        if clip_gaussian_nonnegative:
+            np.maximum(dense, 0.0, out=dense)
+        out.layers[lognorm_layer] = dense.astype(np.float32)
+    else:
+        raise ValueError(f"Unknown noise_type={noise_type!r}; expected 'dropout' or 'gaussian'.")
+
+    return out
+
+
+def run_sensitivity(
+    adata: ad.AnnData,
+    name: str,
+    lognorm_layer: str = NORM_LAYER_KEY,
+    control_label: str = "control",
+    size_fractions: list[float] | None = None,
+    noise_type: str = "dropout",
+    noise_levels: list[float] | None = None,
+    n_seeds: int = 5,
+    n_pca_components: int = 30,
+    vendi_max_cells: int = 20000,
+    seed: int = 0,
+    counts_layer: str = "counts",
+    dropout_space: str = "counts",
+    noise_target: str = "all",
+    clip_gaussian_nonnegative: bool = True,
+) -> pd.DataFrame:
+    """
+    Sweep the Vendi score across size and noise, returning a long results table.
+
+    Args:
+        adata: Dataset with a log-normalized ``lognorm_layer`` and
+            ``obs['perturbation']``.
+        name: Dataset label recorded in the output.
+        lognorm_layer: Log-normalized layer used by the Vendi score.
+        control_label: Control label in ``obs['perturbation']``.
+        size_fractions: Cell-subsampling fractions for the size sweep.
+        noise_type: ``"dropout"`` or ``"gaussian"``.
+        noise_levels: Noise levels for the noise sweep.
+        n_seeds: Repeats per condition.
+        n_pca_components: PCA components for the Vendi embedding.
+        vendi_max_cells: Cap on cells used in the noise sweep (for tractability).
+        seed: Base RNG seed.
+        counts_layer: Raw counts layer used for count-level dropout.
+        dropout_space: ``"counts"`` (drop in counts, then renormalize) or
+            ``"log"`` (drop directly in the log-normalized layer).
+        noise_target: ``"all"`` noises every cell; ``"perturbed"`` restricts
+            noise to non-control cells.
+        clip_gaussian_nonnegative: Clip Gaussian-noised values at zero for
+            nonnegative expression spaces. Disable for signed latent features.
+
+    Returns:
+        Long DataFrame with columns
+        ``["dataset", "sweep", "value", "noise_type", "noise_variance_fraction",
+        "seed", "vendi_cell", "vendi_pseudobulk"]``. For gaussian noise,
+        ``value`` is the noise-to-signal ratio (alpha, per-gene) and
+        ``noise_variance_fraction = alpha^2 / (1 + alpha^2)``.
+    """
+    size_fractions = size_fractions or [0.1, 0.25, 0.5, 0.75, 1.0]
+    noise_levels = noise_levels or [0.0, 0.1, 0.25, 0.5]
+    rows: list[dict[str, object]] = []
+    pca_model = fit_control_incremental_pca(
+        data_obj=adata,
+        layer_key=lognorm_layer,
+        control_label=control_label,
+        n_pca_components=n_pca_components,
+        obs_key="perturbation",
+        data_name="adata",
+    )
+    gamma = estimate_mmd_gamma(
+        obs=adata,
+        layer_obs=lognorm_layer,
+        control_label=control_label,
+        seed=seed,
+        pca_model=pca_model,
+    )
+    outer_sigma_squared = estimate_vendi_outer_sigma_squared(
+        ac=adata,
+        gamma=gamma,
+        pca_model=pca_model,
+        layer_key=lognorm_layer,
+        control_label=control_label,
+        random_state=seed,
+    )
+    observed_pseudobulk, observed_control_idx = _pseudobulk_matrix(
+        adata,
+        lognorm_layer,
+        control_label,
+    )
+    n_observed_perturbations = observed_pseudobulk.shape[0] - int(observed_control_idx is not None)
+    pseudobulk_pca_model = None
+    pseudobulk_sigma_squared = None
+    if n_observed_perturbations > 1:
+        pseudobulk_pca_model = fit_vendi_pseudobulk_pca(
+            observed_pseudobulk,
+            control_idx=observed_control_idx,
+            n_pca_components=n_pca_components,
+            random_state=seed,
+        )
+        pseudobulk_sigma_squared = estimate_vendi_pseudobulk_sigma_squared(
+            ac=adata,
+            pca_model=pseudobulk_pca_model,
+            layer_key=lognorm_layer,
+            control_label=control_label,
+            random_state=seed,
+        )
+
+    # Size sweep: subsample cells, recompute Vendi.
+    for fraction in size_fractions:
+        for s in range(n_seeds):
+            rng = np.random.default_rng(seed + s)
+            sub = _subsample_cells(adata, fraction, rng)
+            vendi_cell, vendi_pseudobulk = _compute_vendi_both(
+                sub,
+                lognorm_layer,
+                control_label,
+                n_pca_components,
+                seed + s,
+                pca_model,
+                gamma,
+                outer_sigma_squared,
+                pseudobulk_pca_model,
+                pseudobulk_sigma_squared,
+            )
+            rows.append(
+                {
+                    "dataset": name,
+                    "sweep": "size",
+                    "value": fraction,
+                    "noise_type": "none",
+                    "seed": s,
+                    "vendi_cell": vendi_cell,
+                    "vendi_pseudobulk": vendi_pseudobulk,
+                }
+            )
+
+    # Noise sweep: fixed (capped) size, inject noise, recompute Vendi.
+    base = _subsample_cells(
+        adata,
+        min(1.0, vendi_max_cells / max(1, adata.n_obs)),
+        np.random.default_rng(seed),
+    )
+    base_layer = base.layers[lognorm_layer]
+    base_dense = (
+        base_layer.toarray()
+        if sparse.issparse(base_layer)
+        else np.asarray(base_layer, dtype=np.float64)
+    )
+    gaussian_gene_std = base_dense.std(axis=0, keepdims=True)
+    gaussian_noise_by_seed = {
+        s: np.random.default_rng(seed + s).standard_normal(size=base_dense.shape)
+        for s in range(n_seeds)
+    }
+    for level in noise_levels:
+        # For gaussian noise, `level` is alpha (noise-to-signal std ratio); the
+        # fraction of total variance that is noise is alpha^2 / (1 + alpha^2).
+        variance_fraction = (
+            (level**2) / (1.0 + level**2) if noise_type == "gaussian" else float("nan")
+        )
+        for s in range(n_seeds):
+            rng = np.random.default_rng(seed + s)
+            noised = _inject_noise(
+                base,
+                lognorm_layer,
+                noise_type,
+                level,
+                rng,
+                counts_layer=counts_layer,
+                dropout_space=dropout_space,
+                control_label=control_label,
+                noise_target=noise_target,
+                gaussian_standard_noise=gaussian_noise_by_seed[s],
+                gaussian_gene_std=gaussian_gene_std,
+                clip_gaussian_nonnegative=clip_gaussian_nonnegative,
+            )
+            vendi_cell, vendi_pseudobulk = _compute_vendi_both(
+                noised,
+                lognorm_layer,
+                control_label,
+                n_pca_components,
+                seed + s,
+                pca_model,
+                gamma,
+                outer_sigma_squared,
+                pseudobulk_pca_model,
+                pseudobulk_sigma_squared,
+            )
+            rows.append(
+                {
+                    "dataset": name,
+                    "sweep": "noise",
+                    "value": level,
+                    "noise_type": noise_type,
+                    "noise_variance_fraction": variance_fraction,
+                    "seed": s,
+                    "vendi_cell": vendi_cell,
+                    "vendi_pseudobulk": vendi_pseudobulk,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def summarize_sensitivity(results: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate the Vendi sweep into mean/std/CV per condition across seeds."""
+    grouped = results.groupby(["dataset", "sweep", "value", "noise_type"], as_index=False).agg(
+        vendi_cell_mean=("vendi_cell", "mean"),
+        vendi_cell_std=("vendi_cell", "std"),
+        vendi_pseudobulk_mean=("vendi_pseudobulk", "mean"),
+        vendi_pseudobulk_std=("vendi_pseudobulk", "std"),
+        noise_variance_fraction=("noise_variance_fraction", "first"),
+        n_seeds=("seed", "count"),
+    )
+    grouped["vendi_cell_cv"] = grouped["vendi_cell_std"] / grouped["vendi_cell_mean"].abs()
+    grouped["vendi_pseudobulk_cv"] = (
+        grouped["vendi_pseudobulk_std"] / grouped["vendi_pseudobulk_mean"].abs()
+    )
+    return grouped
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
+    parser = argparse.ArgumentParser(description="Vendi score sensitivity to size and noise.")
+    parser.add_argument("--name", default=None)
+    parser.add_argument("--dataset-path", required=True, help="Path to the real dataset .h5ad.")
+    parser.add_argument("--control-label", default="control")
+    parser.add_argument("--counts-layer", default="counts")
+    parser.add_argument("--lognorm-layer", default=NORM_LAYER_KEY)
+    parser.add_argument("--size-fractions", default="0.1,0.25,0.5,0.75,1.0")
+    parser.add_argument("--noise-type", default="dropout", choices=["dropout", "gaussian"])
+    parser.add_argument(
+        "--dropout-space",
+        default="counts",
+        choices=["counts", "log"],
+        help="Apply dropout in raw counts (renormalized) or directly in log space.",
+    )
+    parser.add_argument(
+        "--noise-target",
+        default="perturbed",
+        choices=["all", "perturbed"],
+        help="Inject noise into all cells or only non-control (perturbed) cells.",
+    )
+    parser.add_argument("--noise-levels", default="0.0,0.1,0.25,0.5")
+    parser.add_argument("--n-seeds", type=int, default=5)
+    parser.add_argument("--n-pca-components", type=int, default=30)
+    parser.add_argument("--vendi-max-cells", type=int, default=20000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output-dir", default=_DEFAULT_OUTPUT_DIR)
+    return parser
+
+
+def main() -> None:
+    """Parse arguments, load/generate a dataset, and write the sensitivity sweep."""
+    args = _build_parser().parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    name = args.name or Path(args.dataset_path).stem
+    print(f"Loading real dataset {args.dataset_path} ...")
+    adata, _ = load_real_dataset(dataset_path=args.dataset_path)
+
+    ensure_normalized_log1p_layer(
+        adata, output_layer_key=args.lognorm_layer, source_layer=args.counts_layer
+    )
+    print(f"Dataset {name!r}: {adata.n_obs} cells x {adata.n_vars} genes.")
+
+    results = run_sensitivity(
+        adata,
+        name=name,
+        lognorm_layer=args.lognorm_layer,
+        control_label=args.control_label,
+        size_fractions=_parse_float_list(args.size_fractions),
+        noise_type=args.noise_type,
+        noise_levels=_parse_float_list(args.noise_levels),
+        n_seeds=args.n_seeds,
+        n_pca_components=args.n_pca_components,
+        vendi_max_cells=args.vendi_max_cells,
+        seed=args.seed,
+        counts_layer=args.counts_layer,
+        dropout_space=args.dropout_space,
+        noise_target=args.noise_target,
+    )
+    summary = summarize_sensitivity(results)
+
+    results_path = output_dir / f"{name}_vendi_sensitivity.csv"
+    summary_path = output_dir / f"{name}_vendi_sensitivity_summary.csv"
+    results.to_csv(results_path, index=False)
+    summary.to_csv(summary_path, index=False)
+    print(f"\nWrote raw results to {results_path}")
+    print(f"Wrote summary to {summary_path}")
+    print(summary.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
