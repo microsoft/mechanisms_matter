@@ -29,33 +29,42 @@ To cite the paper:
 
 ### CausalDGP
 
-[CausalDGP](transportability/src/perturbations/data/dgp/causalDGP.py) is the proposed data-generating process for realistic synthetic single-cell perturbation data. It represents gene expression with stochastic causal dynamics,
+[CausalDGP](transportability/src/perturbations/data/dgp/causalDGP.py) is the proposed data-generating process for realistic *semi-synthetic* single-cell perturbation data. It models gene expression as an SDE,
 
 $$
-d\mathbf{x} = (A\mathbf{x} + \mathbf{b} + \mathbf{c}_q)\,dt + \sqrt{2}\,d\mathbf{W},
+d\mathbf{x} = (A\mathbf{x} + B + \Gamma_q)\,dt + \sqrt{2}\,d\mathbf{W}
 $$
 
-where $A$ is a sparse gene-regulatory network, $\mathbf{b}$ is the baseline state, and $\mathbf{c}_q$ encodes perturbation $q$. The simulator generates two cellular contexts and can vary the regulatory network $A$, baseline state $\mathbf{b}$, both, or neither through `--diversity_type`. This makes it possible to test transportability under explicit, controlled changes to the underlying causal mechanism.
+where $A$ is a sparse gene-regulatory network, $B$ is the baseline state, $\Gamma_q$ is the perturbation effect, and $q$ is the perturbation. The simulator generates two cellular contexts and can vary $A$, $B$, both, or neither through `--diversity_type` to test transportability under controlled causal changes. See [Example Runs](#example-runs) to generate and evaluate CausalDGP datasets.
 
-Latent steady-state expression is converted into sparse count data using gene-specific dispersion estimates fitted from Norman19. The returned `AnnData` contains raw counts in `.X`, normalized log-expression in `.layers["normalized_log1p"]`, perturbation and context labels in `.obs`, and the affected-gene masks for each context. Use the synthetic sweep under [Example Runs](#example-runs) to generate and evaluate CausalDGP datasets.
+### Real Datasets
+
+The following Perturb-seq datasets are used for real-data experiments:
+
+| Dataset | Cell Lines | Source |
+|---------|-----------|--------|
+| Norman19 | K562 | [Norman et al. 2019](https://pmc.ncbi.nlm.nih.gov/articles/PMC6746554/) |
+| Replogle22 | K562, RPE1 | [Replogle et al. 2022](https://www.sciencedirect.com/science/article/pii/S0092867422005979) |
+| Nadig25 | Jurkat, HepG2 | [Nadig et al. 2025](https://www.nature.com/articles/s41588-025-02169-3) |
+| Zhu25 | Primary human CD4+ T cells across 4 donors | [Zhu et al. 2025](https://doi.org/10.64898/2025.12.23.696273) |
+
+See the per-dataset README files under [`transportability/src/perturbations/data/`](transportability/src/perturbations/data/) for download and preprocessing instructions.
 
 ### Simulator Validation
 
-[The simulator-validation analysis](transportability/src/perturbations/analyses/simulator_validation/generate_statistics.py) compares real and synthetic data using gene-wise and cell-wise marginal statistics, gene-pair correlations, and TRADE perturbation-effect statistics. It reports medians with bootstrap confidence intervals, either pooled or separately by context.
+[The simulator-validation analysis](transportability/src/perturbations/analyses/simulator_validation/generate_statistics.py) compares real and synthetic data using gene-wise and cell-wise marginal statistics, gene-pair correlations, and TRADE ([Nadig et al. 2025](https://www.nature.com/articles/s41588-025-02169-3)) perturbation-effect statistics.
 
-After completing the setup and changing to `transportability/src/perturbations/`, generate a CausalDGP validation summary with:
+## Context-Aware Splitting
 
-```bash
-uv run python -m perturbations.analyses.simulator_validation.generate_statistics \
-  --source synthetic \
-  --name causalDGP \
-  --G 128 \
-  --P 128 \
-  --diversity-type both \
-  --output-dir results/simulator_validation
-```
+![Context-aware splitting](context_splitting.png)
 
-For synthetic data, the analysis defaults to reporting each `cell_line` context separately. It writes `causalDGP_validation_summary.csv` and `causalDGP_perturbation_effect.csv` to `results/simulator_validation/`.
+The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) partitions cells into train, validation, and test sets under two strategies that share a single seeded plan per trial for quantifying the cross-context generalization gap.
+
+## Metrics
+
+The `perturbations` package provides evaluation metrics for perturbation models across three categories: perturbation effect, reconstruction, and gene selection. The [proposed Vendi score](transportability/src/perturbations/metrics/reconstruction/vendi_score.py) is used in two forms: a cell-level Vendi score for distributional reconstruction and a pseudobulk Vendi score for perturbation effects.
+
+The [Vendi sensitivity analysis](transportability/src/perturbations/analyses/simulator_validation/vendi_sensitivity.py) evaluates how stable both forms of the score are under cell subsampling and injected dropout or Gaussian noise.
 
 ## Prerequisites
 
@@ -113,12 +122,6 @@ The main package is under `transportability/src/perturbations/`:
 - `metrics/`: reconstruction, perturbation-effect, gene-selection, PDS, and diversity metrics
 - `analyses/`: experiment runners and plotting scripts
 - `results/`: generated experiment outputs
-
-## Metrics
-
-The `perturbations` package provides evaluation metrics for perturbation models across three categories: perturbation effect, reconstruction, and gene selection. The [proposed Vendi score](transportability/src/perturbations/metrics/reconstruction/vendi_score.py) is used in two forms: a cell-level Vendi score for distributional reconstruction and a pseudobulk Vendi score for perturbation effects.
-
-The [Vendi sensitivity analysis](transportability/src/perturbations/analyses/simulator_validation/vendi_sensitivity.py) evaluates how stable both forms of the score are under cell subsampling and injected dropout or Gaussian noise.
 
 ## Direct intended uses
 
