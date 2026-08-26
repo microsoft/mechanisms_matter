@@ -21,7 +21,7 @@ To cite the paper:
 - **Keywords**: Cellular Perturbation, Transportability, Causal Inference
 - **License**: MIT
 
-## Model
+## Transportability Framework
 
 ![Transportability framework](transportability_model-v2.png)
 
