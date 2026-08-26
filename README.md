@@ -23,7 +23,7 @@ To cite the paper:
 
 ## Transportability Framework
 
-![Transportability framework](transportability_model-v2.png)
+<img src="transportability_model-v2.png" alt="Transportability framework" width="600">
 
 ## Data
 
@@ -56,7 +56,7 @@ See the per-dataset README files under [`transportability/src/perturbations/data
 
 ## Context-Aware Splitting
 
-![Context-aware splitting](context_splitting.png)
+<img src="context_splitting.png" alt="Context-aware splitting" width="300">
 
 The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) partitions cells into train, validation, and test sets under two strategies that share a single seeded plan per trial for quantifying the cross-context generalization gap.
 
