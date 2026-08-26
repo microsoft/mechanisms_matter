@@ -737,7 +737,8 @@ def run_one_trial(
     counts_layer: str | None,
     obs_layer: str | None,
     pid: int,
-    norm_target_sum: float | None,
+    norm_target_sum: float,
+    basal_embedding_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Train/evaluate every model for one split and return metric rows."""
     train_idx, val_idx, test_idx = splitter.split(seed=trial_id)
@@ -841,6 +842,7 @@ def run_one_trial(
             control_label="control",
             expression_layer=NORM_LAYER_KEY,
             epochs=100,
+            basal_embedding_key=basal_embedding_key,
         )
         state_pred = np.asarray(state_out["preds"], dtype=np.float32)
         pred = _make_prediction_adata(
@@ -1376,6 +1378,7 @@ def _run_real_experiments_h5ad(
     obs_layer: str | None,
     split_strategy: str,
     norm_target_sum: float,
+    basal_embedding_key: str | None = None,
 ) -> str:
     """Run the existing in-memory AnnData workflow for standard .h5ad datasets."""
     pid = os.getpid()
@@ -1432,6 +1435,7 @@ def _run_real_experiments_h5ad(
             obs_layer=obs_layer,
             pid=pid,
             norm_target_sum=norm_target_sum,
+            basal_embedding_key=basal_embedding_key,
         ),
     )
 
@@ -1511,6 +1515,7 @@ def run_real_experiments(
     split_strategy: str,
     norm_target_sum: float,
     dataset_variant: str | None = None,
+    basal_embedding_key: str | None = None,
 ) -> str:
     """Run all trials for one real dataset and write results/log files."""
     dataset_path, dataset_variant = _resolve_dataset_request(
@@ -1543,6 +1548,7 @@ def run_real_experiments(
         obs_layer=obs_layer,
         split_strategy=split_strategy,
         norm_target_sum=norm_target_sum,
+        basal_embedding_key=basal_embedding_key,
     )
 
 
@@ -1596,6 +1602,16 @@ def real_exp_args(description: str) -> argparse.ArgumentParser:
         default="in-context",
         choices=["in-context", "cross-context"],
     )
+    parser.add_argument(
+        "--basal_embedding_key",
+        type=str,
+        default=None,
+        help=(
+            "Optional obsm key holding a precomputed basal cell embedding (e.g. "
+            "'X_geneformer') for the STATE model. When set, STATE consumes that "
+            "embedding as the basal state and predicts in gene space."
+        ),
+    )
     return parser
 
 
@@ -1612,6 +1628,9 @@ def main() -> None:
 
     counts_layer = None if str(args.counts_layer).lower() == "none" else args.counts_layer
     obs_layer = None if str(args.obs_layer).lower() == "none" else args.obs_layer
+    basal_embedding_key = (
+        None if str(args.basal_embedding_key).lower() in ("none", "") else args.basal_embedding_key
+    )
 
     run_real_experiments(
         dataset_name=args.dataset_name,
@@ -1623,6 +1642,7 @@ def main() -> None:
         obs_layer=obs_layer,
         split_strategy=args.split_strategy,
         norm_target_sum=float(args.norm_target_sum),
+        basal_embedding_key=basal_embedding_key,
     )
 
 
