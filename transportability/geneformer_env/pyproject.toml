@@ -1,0 +1,62 @@
+# Standalone uv project for the Geneformer embedding-extraction stage (AML Stage 1).
+#
+# This is a SEPARATE uv environment from the transportability/STATE project:
+# STATE requires transformers>=5.12, but Geneformer needs an older transformers
+# (it imports `SpecialTokensMixin` from the top-level `transformers` namespace,
+# which newer versions removed). The two cannot share one environment, so the
+# frozen-embedding design keeps them decoupled and communicating only via an
+# .h5ad file that carries obsm["X_geneformer"].
+#
+# Build the isolated env (creates ./.venv):
+#   cd geneformer_env
+#   GIT_LFS_SKIP_SMUDGE=1 uv sync
+#
+# Health check + asset fetch + extraction all run against this env, e.g.:
+#   uv run python check_env.py
+#   uv run python fetch_geneformer_assets.py --model Geneformer-V2-104M --dest ./gf_assets
+#
+# NOTE: GIT_LFS_SKIP_SMUDGE=1 installs the Geneformer *code* only; fetch the model
+# + dictionary assets separately via fetch_geneformer_assets.py to avoid the
+# multi-GB git-LFS checkout.
+
+[project]
+name = "geneformer-extract"
+version = "0.1.0"
+description = "Isolated Geneformer cell-embedding extraction stage"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    # Stay on 4.x: transformers v5 merged/removed `SpecialTokensMixin` (which
+    # Geneformer imports from the top-level namespace). Use the newest 4.x
+    # (>=4.53) so all deserialization + ReDoS advisories patchable within 4.x
+    # are cleared. tokenizers is left unpinned (transformers picks the range).
+    "transformers>=4.53,<5",
+    # Geneformer code from the HF repo (combine with GIT_LFS_SKIP_SMUDGE=1).
+    "geneformer",
+    # Runtime deps for tokenization + embedding extraction.
+    "torch",
+    "datasets<3",
+    "huggingface_hub",
+    "anndata",
+    "scanpy",
+    "numpy",
+    "pandas",
+]
+
+[tool.uv.sources]
+geneformer = { git = "https://huggingface.co/ctheodoris/Geneformer" }
+# CPU torch keeps the env small (no CUDA/triton). For GPU compute, switch the
+# index URL below to a CUDA build (e.g. .../whl/cu121) that matches the node.
+torch = [{ index = "torch-cpu" }]
+
+[[tool.uv.index]]
+name = "torch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# For a CUDA build of torch on GPU compute, point torch at a cuXXX index instead:
+# torch = [{ index = "torch-cuda" }]
+# [[tool.uv.index]]
+# name = "torch-cuda"
+# url = "https://download.pytorch.org/whl/cu121"
+# explicit = true
+
