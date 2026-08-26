@@ -29,7 +29,7 @@ dependencies = [
     # Geneformer imports from the top-level namespace). Use the newest 4.x
     # (>=4.53) so all deserialization + ReDoS advisories patchable within 4.x
     # are cleared. tokenizers is left unpinned (transformers picks the range).
-    "transformers>=4.53,<5",
+    "transformers>=4.53,<6",
     # Geneformer code from the HF repo (combine with GIT_LFS_SKIP_SMUDGE=1).
     "geneformer",
     # Runtime deps for tokenization + embedding extraction.
