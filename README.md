@@ -29,13 +29,13 @@ To cite the paper:
 
 ### CausalDGP
 
-[CausalDGP](transportability/src/perturbations/data/dgp/causalDGP.py) is the proposed data-generating process for realistic *semi-synthetic* single-cell perturbation data. It models gene expression as an SDE,
+[CausalDGP](transportability/src/perturbations/data/dgp/causalDGP.py) is the proposed data-generating process for realistic *semi-synthetic* single-cell perturbation data. It models *context-specific* gene expression as a SDE,
 
 $$
-d\mathbf{x} = (A\mathbf{x} + B + \Gamma_q)\,dt + \sqrt{2}\,d\mathbf{W}
+d X(t) = (A_C X(t) + B_C + \Gamma_q) dt + \sigma d W (t)
 $$
 
-where $A$ is a sparse gene-regulatory network, $B$ is the baseline state, $\Gamma_q$ is the perturbation effect, and $q$ is the perturbation. The simulator generates two cellular contexts and can vary $A$, $B$, both, or neither through `--diversity_type` to test transportability under controlled causal changes. See [Example Runs](#example-runs) to generate and evaluate CausalDGP datasets.
+where $C$ is the cellular context, $A_C$ is a sparse gene-regulatory network, $B_C$ is the baseline state, $\Gamma_q$ is the perturbation effect, and $q$ is the perturbation. The simulator generates two cellular contexts and can vary $A$, $B$, both, or neither through `--diversity_type` to test transportability under controlled causal changes. See [Example Runs](#example-runs) to generate and evaluate CausalDGP datasets.
 
 ### Real Datasets
 
@@ -59,6 +59,19 @@ See the per-dataset README files under [`transportability/src/perturbations/data
 ![Context-aware splitting](context_splitting.png)
 
 The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) partitions cells into train, validation, and test sets under two strategies that share a single seeded plan per trial for quantifying the cross-context generalization gap.
+
+## Models
+
+| Model | Source |
+|-------|--------|
+| Control mean | Included |
+| Pert. mean | Included |
+| linearPCA | Included |
+| scVI | Included |
+| CPA | [CPA](https://github.com/theislab/cpa) |
+| GEARS | [GEARS](https://github.com/snap-stanford/GEARS) |
+| STATE | [STATE](https://github.com/ArcInstitute/state)  |
+| scLDM | [scLDM](https://github.com/czi-ai/scldm) |
 
 ## Metrics
 
