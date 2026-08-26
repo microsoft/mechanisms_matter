@@ -31,6 +31,13 @@ bin/kustomize
 *wandb*
 *model_weights.pth
 
+# Third-party model implementations
+/transportability/src/perturbations/models/cpa/
+/transportability/src/perturbations/models/gears/
+/transportability/src/perturbations/models/scldm/
+/transportability/src/perturbations/models/state_gene/
+/transportability/src/perturbations/models/state.py
+
 # Per-folder .vscode (workspace settings live in .code-workspace)
 .vscode
 

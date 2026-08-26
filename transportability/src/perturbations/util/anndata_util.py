@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -12,8 +11,7 @@ from scipy import sparse
 from sklearn.decomposition import IncrementalPCA
 
 
-# pyright: reportUnknownMemberType=false
-def get_matrix(data_obj: Any, layer_key: str | None):
+def get_matrix(data_obj, layer_key: str | None):
     """Return matrix from X or a requested layer."""
     if layer_key is None:
         return data_obj.X
@@ -68,7 +66,7 @@ def extract_rows(
     return matrix
 
 
-def obs_has_key(obs_obj: Any, key: str) -> bool:
+def obs_has_key(obs_obj, key: str) -> bool:
     """Return True when an obs-like object contains the requested key."""
     if obs_obj is None:
         return False
@@ -80,9 +78,7 @@ def obs_has_key(obs_obj: Any, key: str) -> bool:
     keys_fn = getattr(obs_obj, "keys", None)
     if callable(keys_fn):
         try:
-            keys_result = keys_fn()
-            if isinstance(keys_result, Iterable):
-                return key in set(keys_result)  # type: ignore
+            return key in set(keys_fn())
         except Exception:
             pass
 
@@ -98,7 +94,7 @@ def iterate_batches(
     layer_key: str | None,
     batch_size: int,
     obs_key: str | None = "perturbation",
-) -> Iterable[tuple[np.ndarray, np.ndarray | None]]:
+):
     """
     Iterate rows in mini-batches.
 
@@ -112,7 +108,7 @@ def iterate_batches(
 
     iterate_axis = getattr(data_obj, "iterate_axis", None)
     if callable(iterate_axis):
-        for batch_view, _ in data_obj.iterate_axis(batch_size=batch_size, axis=0, shuffle=False):  # type: ignore
+        for batch_view, _ in data_obj.iterate_axis(batch_size=batch_size, axis=0, shuffle=False):
             matrix = get_matrix(batch_view, layer_key)
             if sparse.issparse(matrix):
                 matrix = matrix.toarray()
@@ -122,7 +118,7 @@ def iterate_batches(
 
             obs_values = None
             if obs_key is not None:
-                obs_values = np.asarray(batch_view.obs[obs_key])  # type: ignore
+                obs_values = np.asarray(batch_view.obs[obs_key])
             yield matrix, obs_values
         return
 
@@ -139,7 +135,7 @@ def iterate_batches(
 
         obs_values = None
         if obs_key is not None:
-            obs_values = np.asarray(batch_view.obs[obs_key])  # type: ignore
+            obs_values = np.asarray(batch_view.obs[obs_key])
         yield matrix, obs_values
 
 
@@ -163,7 +159,7 @@ def fit_control_incremental_pca(
     if int(n_pca_components) <= 0:
         raise ValueError(f"n_pca_components must be a positive integer. Got {n_pca_components}.")
 
-    labels = np.asarray(data_obj.obs[obs_key])  # type: ignore
+    labels = np.asarray(data_obj.obs[obs_key])
     n_control = int(np.sum(labels == control_label))
     if n_control <= 0:
         raise ValueError(
@@ -175,7 +171,7 @@ def fit_control_incremental_pca(
     if fit_batch_size < n_components:
         raise ValueError(
             f"batch_size ({fit_batch_size}) must be >= n_components "
-            + f"({n_components}) for IncrementalPCA partial_fit."
+            f"({n_components}) for IncrementalPCA partial_fit."
         )
 
     pca_model = IncrementalPCA(n_components=n_components, batch_size=fit_batch_size)
@@ -243,7 +239,7 @@ def fit_incremental_pca_all_cells(
     if fit_batch_size < n_components:
         raise ValueError(
             f"batch_size ({fit_batch_size}) must be >= n_components "
-            + f"({n_components}) for IncrementalPCA partial_fit."
+            f"({n_components}) for IncrementalPCA partial_fit."
         )
 
     pca_model = IncrementalPCA(n_components=n_components, batch_size=fit_batch_size)
