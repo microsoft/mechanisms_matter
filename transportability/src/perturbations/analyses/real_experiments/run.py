@@ -32,12 +32,14 @@ from ...metrics.reconstruction.vendi_score import (
     estimate_vendi_pseudobulk_sigma_squared,
     fit_vendi_pseudobulk_pca,
 )
-from ...models.cpa.cpa import run_cpa
-from ...models.gears.gears import run_gears
 from ...models.linear import predict_linear_pca_baseline
-from ...models.scldm.run_real import run_scldm
-from ...models.scvi_pert import ScviPerturbation
-from ...models.state_gene.state_gene import run_state_gene
+from ...models.optional import (
+    ScviPerturbation,
+    run_cpa,
+    run_gears,
+    run_scldm,
+    run_state_gene,
+)
 from ...util.anndata_util import fit_control_incremental_pca, get_matrix
 from ..common import MODELS, NORM_LAYER_KEY, label_to_target_tokens
 from ..context import (

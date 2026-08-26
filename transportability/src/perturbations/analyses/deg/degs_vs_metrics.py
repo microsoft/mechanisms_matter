@@ -21,11 +21,8 @@ from ...metrics.gene_selection.differential_expression_score import (
     scanpy_de_table,
 )
 from ...metrics.reconstruction.distance_util import estimate_mmd_gamma
-from ...models.cpa.cpa import run_cpa
-from ...models.gears.gears import run_gears
 from ...models.linear import predict_linear_pca_baseline
-from ...models.scvi_pert import ScviPerturbation
-from ...models.state_gene.state_gene import run_state_gene
+from ...models.optional import ScviPerturbation, run_cpa, run_gears, run_state_gene
 from ...util.anndata_util import fit_control_incremental_pca, get_matrix
 from ..common import MODELS, NORM_LAYER_KEY, label_to_target_tokens
 from ..context import DEFAULT_CONTEXT_AXIS, ContextSplitter

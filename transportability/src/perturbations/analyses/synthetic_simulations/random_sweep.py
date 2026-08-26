@@ -23,12 +23,14 @@ from perturbations.metrics.reconstruction.vendi_score import (
     fit_vendi_pseudobulk_pca,
     vendi_score,
 )
-from perturbations.models.cpa.cpa import run_cpa
-from perturbations.models.gears.gears import run_gears
 from perturbations.models.linear import predict_linear_pca_baseline
-from perturbations.models.scldm.run_real import run_scldm
-from perturbations.models.scvi_pert import ScviPerturbation
-from perturbations.models.state_gene.state_gene import run_state_gene
+from perturbations.models.optional import (
+    ScviPerturbation,
+    run_cpa,
+    run_gears,
+    run_scldm,
+    run_state_gene,
+)
 from perturbations.util.anndata_util import fit_control_incremental_pca
 
 from ...data.dgp import causalDGP, directDGP

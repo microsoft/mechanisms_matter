@@ -26,3 +26,18 @@ def lazy_model_runner(
         return implementation(*args, **kwargs)
 
     return run
+
+
+run_cpa = lazy_model_runner("perturbations.models.cpa.cpa", "run_cpa", "CPA")
+run_gears = lazy_model_runner("perturbations.models.gears.gears", "run_gears", "GEARS")
+run_scldm = lazy_model_runner("perturbations.models.scldm.run_real", "run_scldm", "scLDM")
+run_state_gene = lazy_model_runner(
+    "perturbations.models.state_gene.state_gene",
+    "run_state_gene",
+    "STATE",
+)
+ScviPerturbation = lazy_model_runner(
+    "perturbations.models.scvi_pert",
+    "ScviPerturbation",
+    "scVI",
+)
