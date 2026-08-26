@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
-import importlib
 import os
 import sys
 import time
@@ -14,11 +13,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Protocol, cast
+from typing import Any
 
 import anndata as ad
 import numpy as np
 import pandas as pd
+import torch
 from scipy import sparse
 
 from ...data.cd4_chunked import CD4ChunkedDataset
@@ -86,18 +86,6 @@ _METRIC_COLUMNS = [
     "pds_l2",
     "pds_cosine",
 ]
-
-
-class _CudaModule(Protocol):
-    """Subset of ``torch.cuda`` used during process cleanup."""
-
-    def is_available(self) -> bool:
-        """Return whether a CUDA device is available."""
-        ...
-
-    def empty_cache(self) -> None:
-        """Release unoccupied cached CUDA memory."""
-        ...
 
 
 @dataclass(frozen=True)
@@ -214,13 +202,8 @@ def _concat_nonempty_adatas(adatas: list[ad.AnnData]) -> ad.AnnData:
 def _release_process_memory() -> None:
     """Release unreachable objects, CUDA cache, and free Linux heap pages."""
     gc.collect()
-    try:
-        cuda_module = cast(_CudaModule, importlib.import_module("torch.cuda"))
-    except ModuleNotFoundError:
-        cuda_module = None
-    if cuda_module is not None:
-        if cuda_module.is_available():
-            cuda_module.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if sys.platform == "linux":
         ctypes.CDLL(None).malloc_trim(0)
 
