@@ -160,16 +160,28 @@ def _shift_causal_matrix(
 
     We try ARPACK eigs(which='LR') on the non-symmetric A. If it fails, we fall back to using
     the symmetric part (A + A.T)/2 which provides an upper bound on spectral abscissa.
+
+    ARPACK draws a random starting vector when ``v0`` is not supplied, so at the loose
+    ``tol`` used here the returned eigenvalue varies between otherwise identical calls.
+    That jitter propagates into the diagonal shift below and makes the whole generator
+    irreproducible even at a fixed ``seed``, because ARPACK's randomness lives in its own
+    internal state rather than in the caller's seeded ``Generator``. Pin ``v0`` so the
+    estimate is a deterministic function of ``A``.
     """
     G = A.shape[0]
+    v0 = np.ones(G, dtype=np.float64)
     try:
         # largest real part eigenvalue estimate
-        vals = spla.eigs(A, k=1, which="LR", return_eigenvectors=False, tol=1e-2, maxiter=2000)
+        vals = spla.eigs(
+            A, k=1, which="LR", return_eigenvectors=False, tol=1e-2, maxiter=2000, v0=v0
+        )
         s_est = float(np.max(np.real(vals)))
     except Exception:
         # fallback: use symmetric part upper bound
         As = (A + A.T).multiply(0.5)
-        vals = spla.eigsh(As, k=1, which="LA", return_eigenvectors=False, tol=1e-2, maxiter=2000)
+        vals = spla.eigsh(
+            As, k=1, which="LA", return_eigenvectors=False, tol=1e-2, maxiter=2000, v0=v0
+        )
         s_est = float(vals[0])
 
     A_stable = A - (s_est - target_max_real_eig) * sparse.eye(G, format="csr", dtype=np.float32)
