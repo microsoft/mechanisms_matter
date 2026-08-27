@@ -1,4 +1,4 @@
-"""Compute whole-dataset Vendi scores for the real perturbation datasets."""
+"""Compute Vendi and split-half PDS scores for real and synthetic datasets."""
 
 from __future__ import annotations
 
@@ -12,12 +12,24 @@ from pathlib import Path
 from typing import Any
 
 import anndata as ad
+import numpy as np
 import pandas as pd
 
 from ...data.cd4_chunked import CD4ChunkedDataset
-from ...metrics.reconstruction.vendi_score import vendi_score
+from ...data.dgp import causalDGP
+from ...metrics.perturbation_effect.perturbation_discrimination_score import pds
+from ...metrics.reconstruction.distance_util import estimate_mmd_gamma
+from ...metrics.reconstruction.vendi_score import (
+    estimate_vendi_outer_sigma_squared,
+    estimate_vendi_pseudobulk_sigma_squared,
+    fit_vendi_pseudobulk_pca,
+    vendi_score,
+    vendi_score_pseudobulk,
+)
+from ...util.anndata_util import extract_rows, fit_control_incremental_pca
 from ..common import NORM_LAYER_KEY
 from ..context import get_dataset_context_config
+from ..synthetic_simulations.sampling import load_parameter_estimation_inputs
 from ..util import (
     count_non_control_perturbations,
     ensure_normalized_log1p_layer,
@@ -28,6 +40,8 @@ from ..util import (
 _DEFAULT_OUTPUT_DIR = "results/vendi_score"
 _CONTROL_LABEL = "control"
 _CD4_DATASET = "CD4+"
+_DIVERSITY_TYPES = ("A", "b", "both", "none")
+_SYNTHETIC_CONTEXT_AXIS = "cell_line"
 _REPLOGLE22_VARIANT_PATHS = {
     "RPE1": "data/replogle22/RPE1/processed.h5ad",
     "Jurkat": "data/replogle22/Jurkat/processed.h5ad",
@@ -77,7 +91,12 @@ _OUTPUT_COLUMNS = [
     "dataset_variant",
     "dataset_label",
     "dataset_path",
-    "vendi_score",
+    "scope",
+    "vendi_score_cell",
+    "vendi_score_pseudobulk",
+    "pds_l1",
+    "pds_l2",
+    "pds_cosine",
     "n_cells",
     "n_genes",
     "n_total_perturbations",
@@ -98,6 +117,122 @@ def _require_existing_path(path: str) -> None:
     """Raise a clear error when an expected input artifact is missing."""
     if not Path(path).exists():
         raise FileNotFoundError(f"Dataset input does not exist: {path}")
+
+
+def _estimate_vendi_params(
+    ac: ad.AnnData,
+    layer_key: str | None,
+    control_label: str,
+    n_pca_components: int,
+    random_state: int,
+) -> tuple[Any, float, float]:
+    """Estimate shared PCA, gamma, and outer_sigma_squared from control cells."""
+    pca_model = fit_control_incremental_pca(
+        data_obj=ac,
+        layer_key=layer_key,
+        control_label=control_label,
+        n_pca_components=n_pca_components,
+        obs_key="perturbation",
+        data_name="vendi_input",
+    )
+    gamma = estimate_mmd_gamma(
+        obs=ac,
+        layer_obs=layer_key,
+        control_label=control_label,
+        seed=random_state,
+        pca_model=pca_model,
+    )
+    outer_sigma_squared = estimate_vendi_outer_sigma_squared(
+        ac=ac,
+        gamma=gamma,
+        pca_model=pca_model,
+        layer_key=layer_key,
+        control_label=control_label,
+        random_state=random_state,
+    )
+    return pca_model, gamma, outer_sigma_squared
+
+
+def _pseudobulk_vendi(
+    adata: ad.AnnData,
+    layer_key: str | None,
+    control_label: str,
+    n_pca_components: int,
+    random_state: int,
+) -> float:
+    """Compute pseudobulk-level Vendi score for one AnnData slice."""
+    from ..util import compute_means_by_perturbation
+
+    pert_labels = np.asarray(adata.obs["perturbation"])
+    non_control_ids = np.unique(pert_labels[pert_labels != control_label])
+    if non_control_ids.size < 2:
+        return float("nan")
+    mu = compute_means_by_perturbation(
+        adata_view=adata,
+        perturbation_ids=non_control_ids,
+        layer_key=layer_key,
+    )
+    pb_pca = fit_vendi_pseudobulk_pca(
+        mu, n_pca_components=n_pca_components, random_state=random_state
+    )
+    pb_sigma = estimate_vendi_pseudobulk_sigma_squared(
+        ac=adata,
+        pca_model=pb_pca,
+        layer_key=layer_key,
+        control_label=control_label,
+        random_state=random_state,
+    )
+    return vendi_score_pseudobulk(mu, pca_model=pb_pca, outer_sigma_squared=pb_sigma)
+
+
+def _split_half_pds(
+    adata: ad.AnnData,
+    layer_key: str | None,
+    control_label: str,
+    random_state: int,
+) -> dict[str, float]:
+    """Compute split-half PDS scores from one AnnData slice."""
+    rng = np.random.default_rng(random_state)
+    obs = adata.obs
+    pert_labels = np.asarray(obs["perturbation"])
+    unique_perts = np.unique(pert_labels)
+    non_control = unique_perts[unique_perts != control_label]
+    if non_control.size < 2:
+        return {"pds_l1": np.nan, "pds_l2": np.nan, "pds_cosine": np.nan}
+
+    # Control pseudobulk. `extract_rows` densifies sparse layers and reads one group at a
+    # time, so a dense copy of the whole slice is never materialized.
+    ctrl_mask = pert_labels == control_label
+    if ctrl_mask.sum() == 0:
+        return {"pds_l1": np.nan, "pds_l2": np.nan, "pds_cosine": np.nan}
+    mu_control = (
+        extract_rows(adata, np.flatnonzero(ctrl_mask), layer_key).mean(axis=0).reshape(1, -1)
+    )
+
+    mu_a_list: list[np.ndarray] = []
+    mu_b_list: list[np.ndarray] = []
+    for p in sorted(non_control.tolist(), key=str):
+        idx = np.flatnonzero(pert_labels == p)
+        if idx.size < 2:
+            continue
+        shuffled = rng.permutation(idx)
+        mid = len(shuffled) // 2
+        # Sorted row indices keep backed/collection slicing valid; the mean is order-invariant.
+        mu_a_list.append(extract_rows(adata, np.sort(shuffled[:mid]), layer_key).mean(axis=0))
+        mu_b_list.append(extract_rows(adata, np.sort(shuffled[mid:]), layer_key).mean(axis=0))
+
+    if len(mu_a_list) < 2:
+        return {"pds_l1": np.nan, "pds_l2": np.nan, "pds_cosine": np.nan}
+
+    mu_a = np.stack(mu_a_list)
+    mu_b = np.stack(mu_b_list)
+    # Average both directions so the score is symmetric across splits.
+    scores: dict[str, float] = {}
+    for m in ("l1", "l2", "cosine"):
+        fwd = pds(X_obs=mu_a, X_pred=mu_b, reference=mu_control, metric=m)
+        rev = pds(X_obs=mu_b, X_pred=mu_a, reference=mu_control, metric=m)
+        scores[f"pds_{m}"] = 0.5 * (fwd + rev)
+    return scores
 
 
 def _parse_optional_layer(layer_name: str | None) -> str | None:
@@ -213,7 +348,8 @@ def _base_result_row(
         "dataset_variant": spec.dataset_variant,
         "dataset_label": spec.dataset_label,
         "dataset_path": spec.dataset_path,
-        "vendi_score": score,
+        "scope": "all",
+        "vendi_score_cell": score,
         "n_cells": int(obs.shape[0]),
         "n_genes": int(n_vars),
         "n_total_perturbations": count_non_control_perturbations(
@@ -243,8 +379,9 @@ def _compute_h5ad_vendi_score(
     sample_size: int,
     random_state: int,
     norm_target_sum: float,
-) -> dict[str, Any]:
-    """Load one in-memory h5ad dataset and compute its whole-dataset Vendi score."""
+    by_context: bool = True,
+) -> list[dict[str, Any]]:
+    """Load one in-memory h5ad dataset and compute Vendi score(s)."""
     _require_existing_path(spec.dataset_path)
 
     adata, _ = load_real_dataset(dataset_path=spec.dataset_path)
@@ -264,30 +401,56 @@ def _compute_h5ad_vendi_score(
             control_label=_CONTROL_LABEL,
         )
 
-        start_time = time.perf_counter()
-        score = vendi_score(
-            ac=adata,
-            ac_batch_size=batch_size,
-            n_pca_components=n_pca_components,
-            sample_size=sample_size,
-            random_state=random_state,
-            layer_key=vendi_layer_key,
-            control_label=_CONTROL_LABEL,
-        )
-        execution_time_seconds = time.perf_counter() - start_time
+        slices: list[tuple[str, ad.AnnData]] = []
+        if by_context:
+            context_axis, context_values = _context_metadata(adata.obs, spec.dataset)
+            for ctx_val in context_values:
+                mask = adata.obs[context_axis].astype(str) == ctx_val
+                slices.append((ctx_val, adata[mask]))
+        else:
+            slices.append(("all", adata))
 
-        return _base_result_row(
-            spec=spec,
-            obs=adata.obs,
-            n_vars=adata.n_vars,
-            reported_layer_key=obs_layer or "X",
-            batch_size=batch_size,
-            n_pca_components=n_pca_components,
-            sample_size=sample_size,
-            random_state=random_state,
-            execution_time_seconds=execution_time_seconds,
-            score=score,
-        )
+        rows: list[dict[str, Any]] = []
+        for scope_label, adata_slice in slices:
+            pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
+                adata_slice, vendi_layer_key, _CONTROL_LABEL, n_pca_components, random_state
+            )
+            start_time = time.perf_counter()
+            score = vendi_score(
+                ac=adata_slice,
+                ac_batch_size=batch_size,
+                n_pca_components=n_pca_components,
+                sample_size=sample_size,
+                random_state=random_state,
+                layer_key=vendi_layer_key,
+                control_label=_CONTROL_LABEL,
+                gamma=gamma,
+                pca_model=pca_model,
+                outer_sigma_squared=outer_sigma_squared,
+            )
+            pds_scores = _split_half_pds(adata_slice, vendi_layer_key, _CONTROL_LABEL, random_state)
+            pb_vendi = _pseudobulk_vendi(
+                adata_slice, vendi_layer_key, _CONTROL_LABEL, n_pca_components, random_state
+            )
+            execution_time_seconds = time.perf_counter() - start_time
+
+            row = _base_result_row(
+                spec=spec,
+                obs=adata_slice.obs,
+                n_vars=adata_slice.n_vars,
+                reported_layer_key=obs_layer or "X",
+                batch_size=batch_size,
+                n_pca_components=n_pca_components,
+                sample_size=sample_size,
+                random_state=random_state,
+                execution_time_seconds=execution_time_seconds,
+                score=score,
+            )
+            row["scope"] = scope_label
+            row["vendi_score_pseudobulk"] = pb_vendi
+            row.update(pds_scores)
+            rows.append(row)
+        return rows
     finally:
         del adata
         gc.collect()
@@ -301,8 +464,9 @@ def _compute_cd4_vendi_score(
     n_pca_components: int,
     sample_size: int,
     random_state: int,
-) -> dict[str, Any]:
-    """Compute whole-dataset Vendi for CD4+ using a backed AnnCollection."""
+    by_context: bool = True,
+) -> list[dict[str, Any]]:
+    """Compute Vendi score(s) for CD4+ using a backed AnnCollection."""
     _require_existing_path(spec.dataset_path)
 
     runtime = CD4ChunkedDataset.from_manifest(spec.dataset_path)
@@ -313,32 +477,69 @@ def _compute_cd4_vendi_score(
         control_label=_CONTROL_LABEL,
     )
 
+    context_axis, context_values = _context_metadata(runtime.obs, spec.dataset)
+    if by_context:
+        scopes = [(ctx_val, ctx_val) for ctx_val in context_values]
+    else:
+        scopes = [("all", None)]
+
+    rows: list[dict[str, Any]] = []
     with runtime.open_collection() as handle:
-        start_time = time.perf_counter()
-        score = vendi_score(
-            ac=handle.collection,
-            ac_batch_size=batch_size,
-            n_pca_components=n_pca_components,
-            sample_size=sample_size,
-            random_state=random_state,
-            layer_key=vendi_layer_key,
-            control_label=_CONTROL_LABEL,
-        )
-        execution_time_seconds = time.perf_counter() - start_time
+        for scope_label, ctx_val in scopes:
+            if ctx_val is not None:
+                ctx_mask = runtime.obs[context_axis].astype(str) == ctx_val
+                indices = ctx_mask.to_numpy().nonzero()[0]
+                ac_slice = handle.collection[indices]
+            else:
+                ac_slice = handle.collection
+
+            pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
+                ac_slice, vendi_layer_key, _CONTROL_LABEL, n_pca_components, random_state
+            )
+            start_time = time.perf_counter()
+            score = vendi_score(
+                ac=ac_slice,
+                ac_batch_size=batch_size,
+                n_pca_components=n_pca_components,
+                sample_size=sample_size,
+                random_state=random_state,
+                layer_key=vendi_layer_key,
+                control_label=_CONTROL_LABEL,
+                gamma=gamma,
+                pca_model=pca_model,
+                outer_sigma_squared=outer_sigma_squared,
+            )
+            # CD4 backed slices: materialize for PDS pseudobulk computation
+            if hasattr(ac_slice, "to_adata"):
+                pds_adata = ac_slice.to_adata()
+            else:
+                pds_adata = ac_slice
+            pds_scores = _split_half_pds(pds_adata, vendi_layer_key, _CONTROL_LABEL, random_state)
+            pb_vendi = _pseudobulk_vendi(
+                pds_adata, vendi_layer_key, _CONTROL_LABEL, n_pca_components, random_state
+            )
+            execution_time_seconds = time.perf_counter() - start_time
+
+            obs_slice = runtime.obs if ctx_val is None else runtime.obs[ctx_mask]
+            row = _base_result_row(
+                spec=spec,
+                obs=obs_slice,
+                n_vars=runtime.n_vars,
+                reported_layer_key=obs_layer or "X",
+                batch_size=batch_size,
+                n_pca_components=n_pca_components,
+                sample_size=sample_size,
+                random_state=random_state,
+                execution_time_seconds=execution_time_seconds,
+                score=score,
+            )
+            row["scope"] = scope_label
+            row["vendi_score_pseudobulk"] = pb_vendi
+            row.update(pds_scores)
+            rows.append(row)
 
     try:
-        return _base_result_row(
-            spec=spec,
-            obs=runtime.obs,
-            n_vars=runtime.n_vars,
-            reported_layer_key=obs_layer or "X",
-            batch_size=batch_size,
-            n_pca_components=n_pca_components,
-            sample_size=sample_size,
-            random_state=random_state,
-            execution_time_seconds=execution_time_seconds,
-            score=score,
-        )
+        return rows
     finally:
         del runtime
         gc.collect()
@@ -351,10 +552,11 @@ def run_real_dataset_vendi_scores(
     obs_layer: str | None = NORM_LAYER_KEY,
     counts_layer: str | None = "counts",
     batch_size: int = 1024,
-    n_pca_components: int = 30,
+    n_pca_components: int = 50,
     sample_size: int = 2000,
     random_state: int = 0,
     norm_target_sum: float = 1e4,
+    by_context: bool = True,
 ) -> str:
     """
     Compute whole-dataset Vendi scores for all configured real datasets.
@@ -369,6 +571,7 @@ def run_real_dataset_vendi_scores(
         sample_size: Number of cells sampled for MMD bandwidth estimation.
         random_state: Random seed for deterministic sampling.
         norm_target_sum: Library-size target sum when constructing ``normalized_log1p``.
+        by_context: When True, score each context value separately instead of the whole dataset.
 
     Returns:
         Path to the written result CSV.
@@ -391,16 +594,17 @@ def run_real_dataset_vendi_scores(
     for spec in selected_specs:
         print(f"Computing Vendi score for {spec.dataset_label} from {spec.dataset_path}")
         if spec.is_cd4_chunked:
-            row = _compute_cd4_vendi_score(
+            spec_rows = _compute_cd4_vendi_score(
                 spec=spec,
                 obs_layer=obs_layer,
                 batch_size=int(batch_size),
                 n_pca_components=int(n_pca_components),
                 sample_size=int(sample_size),
                 random_state=int(random_state),
+                by_context=by_context,
             )
         else:
-            row = _compute_h5ad_vendi_score(
+            spec_rows = _compute_h5ad_vendi_score(
                 spec=spec,
                 obs_layer=obs_layer,
                 counts_layer=counts_layer,
@@ -409,23 +613,194 @@ def run_real_dataset_vendi_scores(
                 sample_size=int(sample_size),
                 random_state=int(random_state),
                 norm_target_sum=float(norm_target_sum),
+                by_context=by_context,
             )
-        rows.append(row)
-        print(
-            f"  vendi_score={row['vendi_score']:.6g}, "
-            f"cells={row['n_cells']}, genes={row['n_genes']}, "
-            f"contexts={row['n_contexts']} ({row['context_values']})"
-        )
+        for row in spec_rows:
+            rows.append(row)
+            print(
+                f"  [{row.get('scope', 'all')}] vendi_cell={row['vendi_score_cell']:.6g}, "
+                f"cells={row['n_cells']}, genes={row['n_genes']}, "
+                f"perturbations={row['n_total_perturbations']}"
+            )
         pd.DataFrame(rows, columns=_OUTPUT_COLUMNS).to_csv(output_path, index=False)
 
     print(f"Done. Vendi scores saved to: {output_path}")
     return str(output_path)
 
 
+# ---------------------------------------------------------------------------
+# Synthetic CausalDGP scoring
+# ---------------------------------------------------------------------------
+
+
+def _compute_synthetic_vendi_score(
+    *,
+    diversity_type: str,
+    n_genes: int,
+    n_control: int,
+    n_per_perturbation: int,
+    n_perturbations: int,
+    batch_size: int,
+    n_pca_components: int,
+    sample_size: int,
+    random_state: int,
+    by_context: bool,
+) -> list[dict[str, Any]]:
+    """Generate one CausalDGP dataset and compute Vendi + PDS scores."""
+    inputs = load_parameter_estimation_inputs()
+    adata, _ = causalDGP(
+        G=n_genes,
+        N0=n_control,
+        Nk=n_per_perturbation,
+        P=n_perturbations,
+        mu_l=1.0,
+        all_theta=inputs["all_theta"],
+        gene_names=inputs["gene_names"],
+        mask_method="Erdos-Renyi",
+        diversity_type=diversity_type,
+        swap_fraction=0.5,
+        seed=random_state,
+        normalize=True,
+        normalized_layer_key=NORM_LAYER_KEY,
+    )
+
+    layer_key: str | None = None  # use normalized .X
+    slices: list[tuple[str, ad.AnnData]] = []
+    if by_context and _SYNTHETIC_CONTEXT_AXIS in adata.obs.columns:
+        for ctx_val in sorted(adata.obs[_SYNTHETIC_CONTEXT_AXIS].astype(str).unique()):
+            mask = adata.obs[_SYNTHETIC_CONTEXT_AXIS].astype(str) == ctx_val
+            slices.append((ctx_val, adata[mask]))
+    else:
+        slices.append(("all", adata))
+
+    rows: list[dict[str, Any]] = []
+    for scope_label, adata_slice in slices:
+        pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
+            adata_slice, layer_key, _CONTROL_LABEL, n_pca_components, random_state
+        )
+        start_time = time.perf_counter()
+        score = vendi_score(
+            ac=adata_slice,
+            ac_batch_size=batch_size,
+            n_pca_components=n_pca_components,
+            sample_size=sample_size,
+            random_state=random_state,
+            layer_key=layer_key,
+            control_label=_CONTROL_LABEL,
+            gamma=gamma,
+            pca_model=pca_model,
+            outer_sigma_squared=outer_sigma_squared,
+        )
+        pds_scores = _split_half_pds(adata_slice, layer_key, _CONTROL_LABEL, random_state)
+        pb_vendi = _pseudobulk_vendi(
+            adata_slice, layer_key, _CONTROL_LABEL, n_pca_components, random_state
+        )
+        execution_time_seconds = time.perf_counter() - start_time
+
+        pert_labels = np.asarray(adata_slice.obs["perturbation"])
+        n_perts = int(np.unique(pert_labels[pert_labels != _CONTROL_LABEL]).size)
+        ctx_values = (
+            sorted(adata_slice.obs[_SYNTHETIC_CONTEXT_AXIS].astype(str).unique())
+            if _SYNTHETIC_CONTEXT_AXIS in adata_slice.obs.columns
+            else []
+        )
+
+        row: dict[str, Any] = {
+            "dataset": "causalDGP",
+            "dataset_variant": diversity_type,
+            "dataset_label": f"causalDGP_{diversity_type}",
+            "dataset_path": "generated",
+            "scope": scope_label,
+            "vendi_score_cell": score,
+            "vendi_score_pseudobulk": pb_vendi,
+            "n_cells": int(adata_slice.n_obs),
+            "n_genes": int(adata_slice.n_vars),
+            "n_total_perturbations": n_perts,
+            "n_contexts": len(ctx_values),
+            "context_axis": _SYNTHETIC_CONTEXT_AXIS,
+            "context_values": ";".join(ctx_values),
+            "layer_key": "X",
+            "ac_batch_size": batch_size,
+            "n_pca_components": n_pca_components,
+            "sample_size": sample_size,
+            "random_state": random_state,
+            "control_label": _CONTROL_LABEL,
+            "execution_time_seconds": execution_time_seconds,
+        }
+        row.update(pds_scores)
+        rows.append(row)
+
+    del adata
+    gc.collect()
+    return rows
+
+
+def run_synthetic_vendi_scores(
+    *,
+    output_dir: str = _DEFAULT_OUTPUT_DIR,
+    diversity_types: Sequence[str] | None = None,
+    n_genes: int = 128,
+    n_control: int = 1024,
+    n_per_perturbation: int = 1024,
+    n_perturbations: int = 128,
+    batch_size: int = 1024,
+    n_pca_components: int = 50,
+    sample_size: int = 2000,
+    random_state: int = 0,
+    by_context: bool = True,
+) -> str:
+    """Compute Vendi + PDS for CausalDGP under each diversity scenario."""
+    if diversity_types is None:
+        diversity_types = list(_DIVERSITY_TYPES)
+    for dt in diversity_types:
+        if dt not in _DIVERSITY_TYPES:
+            raise ValueError(f"Unknown diversity_type={dt!r}. Choose from {_DIVERSITY_TYPES}.")
+
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir_path / (
+        f"synthetic_vendi_scores_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    )
+
+    rows: list[dict[str, Any]] = []
+    for dt in diversity_types:
+        print(f"Computing scores for causalDGP diversity_type={dt}")
+        spec_rows = _compute_synthetic_vendi_score(
+            diversity_type=dt,
+            n_genes=n_genes,
+            n_control=n_control,
+            n_per_perturbation=n_per_perturbation,
+            n_perturbations=n_perturbations,
+            batch_size=batch_size,
+            n_pca_components=n_pca_components,
+            sample_size=sample_size,
+            random_state=random_state,
+            by_context=by_context,
+        )
+        for row in spec_rows:
+            rows.append(row)
+            print(
+                f"  [{row['scope']}] vendi_cell={row['vendi_score_cell']:.6g}, "
+                f"pds_l1={row.get('pds_l1', float('nan')):.4f}, "
+                f"cells={row['n_cells']}, perts={row['n_total_perturbations']}"
+            )
+        pd.DataFrame(rows, columns=_OUTPUT_COLUMNS).to_csv(output_path, index=False)
+
+    print(f"Done. Synthetic Vendi scores saved to: {output_path}")
+    return str(output_path)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="Compute whole-dataset single-cell MMD Vendi scores for all real datasets."
+        description="Compute Vendi and split-half PDS scores for real and synthetic datasets."
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="real",
+        choices=["real", "synthetic", "both"],
+        help="Score real datasets, synthetic CausalDGP datasets, or both.",
     )
     parser.add_argument("--output_dir", type=str, default=_DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -448,10 +823,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Layer used only to build normalized_log1p for h5ad inputs. Set to 'none' to use adata.X.",
     )
     parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--n_pca_components", type=int, default=30)
+    parser.add_argument("--n_pca_components", type=int, default=50)
     parser.add_argument("--sample_size", type=int, default=2000)
     parser.add_argument("--random_state", type=int, default=0)
     parser.add_argument("--norm_target_sum", type=float, default=1e4)
+    parser.add_argument(
+        "--no_by_context",
+        action="store_true",
+        help="Score the whole dataset instead of each context value separately.",
+    )
+    # Synthetic CausalDGP options.
+    parser.add_argument(
+        "--diversity_type",
+        type=str,
+        nargs="+",
+        choices=list(_DIVERSITY_TYPES),
+        help="Diversity type(s) for CausalDGP. Omit to run all (A, b, both, none).",
+    )
+    parser.add_argument("--n_genes", type=int, default=128, help="Genes for CausalDGP.")
+    parser.add_argument("--n_control", type=int, default=1024, help="Control cells for CausalDGP.")
+    parser.add_argument(
+        "--n_per_perturbation", type=int, default=1024, help="Cells per perturbation for CausalDGP."
+    )
+    parser.add_argument(
+        "--n_perturbations", type=int, default=128, help="Number of perturbations for CausalDGP."
+    )
     return parser
 
 
@@ -463,17 +859,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     """CLI entry point."""
     args = parse_args(argv)
-    run_real_dataset_vendi_scores(
-        output_dir=args.output_dir,
-        dataset_labels=args.dataset_label,
-        obs_layer=_parse_optional_layer(args.obs_layer),
-        counts_layer=_parse_optional_layer(args.counts_layer),
-        batch_size=int(args.batch_size),
-        n_pca_components=int(args.n_pca_components),
-        sample_size=int(args.sample_size),
-        random_state=int(args.random_state),
-        norm_target_sum=float(args.norm_target_sum),
-    )
+    by_context = not args.no_by_context
+
+    if args.source in ("real", "both"):
+        run_real_dataset_vendi_scores(
+            output_dir=args.output_dir,
+            dataset_labels=args.dataset_label,
+            obs_layer=_parse_optional_layer(args.obs_layer),
+            counts_layer=_parse_optional_layer(args.counts_layer),
+            batch_size=int(args.batch_size),
+            n_pca_components=int(args.n_pca_components),
+            sample_size=int(args.sample_size),
+            random_state=int(args.random_state),
+            norm_target_sum=float(args.norm_target_sum),
+            by_context=by_context,
+        )
+
+    if args.source in ("synthetic", "both"):
+        run_synthetic_vendi_scores(
+            output_dir=args.output_dir,
+            diversity_types=args.diversity_type,
+            n_genes=int(args.n_genes),
+            n_control=int(args.n_control),
+            n_per_perturbation=int(args.n_per_perturbation),
+            n_perturbations=int(args.n_perturbations),
+            batch_size=int(args.batch_size),
+            n_pca_components=int(args.n_pca_components),
+            sample_size=int(args.sample_size),
+            random_state=int(args.random_state),
+            by_context=by_context,
+        )
 
 
 if __name__ == "__main__":
