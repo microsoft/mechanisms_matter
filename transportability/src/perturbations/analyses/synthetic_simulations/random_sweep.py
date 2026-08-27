@@ -136,7 +136,7 @@ def get_data_stats(
         "vendi_score": vendi_score(
             ac=adata,
             ac_batch_size=analysis_batch_size,
-            n_pca_components=30,
+            n_pca_components=50,
             sample_size=2_000,
             random_state=vendi_random_state,
             layer_key=NORM_LAYER_KEY,
@@ -472,7 +472,7 @@ def simulate_one_run(
                 ),
                 "vendi_score_obs": vendi_score(
                     ac=bucket_test_eval,
-                    n_pca_components=30,
+                    n_pca_components=50,
                     layer_key=NORM_LAYER_KEY,
                     control_label="control",
                     gamma=bucket_mmd_gamma,

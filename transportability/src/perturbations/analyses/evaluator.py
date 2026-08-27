@@ -244,7 +244,7 @@ def evaluation(
         pred_has_control = bool(np.any(np.asarray(pred.obs["perturbation"]) == control_label))
         vendi_score_pred = vendi_score(
             ac=pred,
-            n_pca_components=30,
+            n_pca_components=50,
             layer_key=layer_name,
             control_label=control_label if pred_has_control else None,
             gamma=mmd_gamma,
@@ -313,7 +313,7 @@ def evaluation(
     if vendi_score_obs is None:
         vendi_score_obs = vendi_score(
             ac=obs,
-            n_pca_components=30,
+            n_pca_components=50,
             layer_key=layer_name,
             control_label=control_label if obs_has_control else None,
             gamma=mmd_gamma,
