@@ -212,3 +212,170 @@ def test_output_columns_include_pds_and_scope() -> None:
     assert "pds_cosine" in _OUTPUT_COLUMNS
     assert "vendi_score_cell" in _OUTPUT_COLUMNS
     assert "vendi_score_pseudobulk" in _OUTPUT_COLUMNS
+
+
+# --- Synthetic CausalDGP layer selection ---
+
+
+def _fake_causal_dgp_adata(seed: int = 0) -> ad.AnnData:
+    """Mimic causalDGP output: raw counts in .X, log-normalized in the layer."""
+    rng = np.random.default_rng(seed)
+    perts = ["control"] + [f"g{i}" for i in range(6)]
+    n_per, n_genes = 40, 12
+    counts = np.empty((n_per * len(perts), n_genes), dtype=np.float32)
+    labels: list[str] = []
+    for i, pert in enumerate(perts):
+        counts[i * n_per : (i + 1) * n_per] = rng.poisson(
+            lam=1.0 + 3.0 * i, size=(n_per, n_genes)
+        ).astype(np.float32)
+        labels.extend([pert] * n_per)
+    obs = pd.DataFrame(
+        {
+            "perturbation": labels,
+            "cell_line": np.tile(["0", "1"], len(labels) // 2).astype(str),
+        }
+    )
+    adata = ad.AnnData(X=counts, obs=obs)
+    totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
+    adata.layers["normalized_log1p"] = np.log1p(counts / totals * 1e4).astype(np.float32)
+    return adata
+
+
+@pytest.fixture
+def patched_synthetic(monkeypatch: pytest.MonkeyPatch):
+    """Patch CausalDGP generation so layer selection can be tested cheaply."""
+    from perturbations.analyses.vendi_score import run_vendi as rv
+
+    monkeypatch.setattr(
+        rv, "load_parameter_estimation_inputs", lambda: {"all_theta": None, "gene_names": None}
+    )
+    monkeypatch.setattr(rv, "causalDGP", lambda **kwargs: (_fake_causal_dgp_adata(), []))
+    return rv
+
+
+def _score_kwargs(**overrides):
+    base = dict(
+        diversity_type="both",
+        n_genes=12,
+        n_control=40,
+        n_per_perturbation=40,
+        n_perturbations=6,
+        batch_size=32,
+        n_pca_components=3,
+        sample_size=64,
+        random_state=0,
+        by_context=False,
+    )
+    base.update(overrides)
+    return base
+
+
+class TestSyntheticObsLayer:
+    def test_defaults_to_normalized_layer_not_raw_x(self, patched_synthetic) -> None:
+        rows = patched_synthetic._compute_synthetic_vendi_score(**_score_kwargs())
+        assert all(row["layer_key"] == "normalized_log1p" for row in rows)
+
+    def test_missing_normalized_layer_raises(self, patched_synthetic) -> None:
+        def _causal_dgp_no_norm(**kwargs):
+            adata = _fake_causal_dgp_adata()
+            del adata.layers["normalized_log1p"]
+            return adata, []
+
+        patched_synthetic.causalDGP = _causal_dgp_no_norm
+        with pytest.raises(KeyError, match="normalized_log1p"):
+            patched_synthetic._compute_synthetic_vendi_score(**_score_kwargs())
+
+
+# --- Real-data layer selection ---
+
+
+def _make_real_adata() -> ad.AnnData:
+    """Build a minimal AnnData mimicking a real dataset with counts + normalized layer."""
+    rng = np.random.default_rng(0)
+    n_per, n_genes = 20, 8
+    perts = ["control", "gene1", "gene2", "gene3"]
+    counts = np.empty((n_per * len(perts), n_genes), dtype=np.float32)
+    labels: list[str] = []
+    for i, p in enumerate(perts):
+        counts[i * n_per : (i + 1) * n_per] = rng.poisson(
+            lam=2.0 + 3.0 * i, size=(n_per, n_genes)
+        ).astype(np.float32)
+        labels.extend([p] * n_per)
+    obs = pd.DataFrame({"perturbation": labels, "cell_line": ["K562"] * len(labels)})
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
+    adata = ad.AnnData(X=counts.copy(), obs=obs, var=var)
+    adata.layers["counts"] = counts.copy()
+    totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
+    adata.layers["normalized_log1p"] = np.log1p(counts / totals * 1e4).astype(np.float32)
+    return adata
+
+
+class TestRealDataLayerSelection:
+    def test_h5ad_defaults_to_normalized_log1p(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from perturbations.analyses.vendi_score import run_vendi as rv
+
+        adata = _make_real_adata()
+        monkeypatch.setattr(rv, "load_real_dataset", lambda dataset_path: (adata, {}))
+        monkeypatch.setattr(
+            rv,
+            "validate_perturbation_targets_subset_from_obs",
+            lambda obs, gene_names, control_label: None,
+        )
+        monkeypatch.setattr(rv, "_require_existing_path", lambda path: None)
+
+        spec = DatasetSpec(
+            dataset="norman19",
+            dataset_variant=None,
+            dataset_label="norman19",
+            dataset_path="fake.h5ad",
+        )
+        rows = rv._compute_h5ad_vendi_score(
+            spec=spec,
+            obs_layer="normalized_log1p",
+            counts_layer="counts",
+            batch_size=32,
+            n_pca_components=3,
+            sample_size=32,
+            random_state=0,
+            norm_target_sum=1e4,
+            by_context=False,
+        )
+        assert len(rows) == 1
+        assert rows[0]["layer_key"] == "normalized_log1p"
+        assert np.isfinite(rows[0]["vendi_score_cell"])
+
+    def test_h5ad_builds_normalized_layer_from_counts_when_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from perturbations.analyses.vendi_score import run_vendi as rv
+
+        adata = _make_real_adata()
+        del adata.layers["normalized_log1p"]
+
+        monkeypatch.setattr(rv, "load_real_dataset", lambda dataset_path: (adata, {}))
+        monkeypatch.setattr(
+            rv,
+            "validate_perturbation_targets_subset_from_obs",
+            lambda obs, gene_names, control_label: None,
+        )
+        monkeypatch.setattr(rv, "_require_existing_path", lambda path: None)
+
+        spec = DatasetSpec(
+            dataset="norman19",
+            dataset_variant=None,
+            dataset_label="norman19",
+            dataset_path="fake.h5ad",
+        )
+        rows = rv._compute_h5ad_vendi_score(
+            spec=spec,
+            obs_layer="normalized_log1p",
+            counts_layer="counts",
+            batch_size=32,
+            n_pca_components=3,
+            sample_size=32,
+            random_state=0,
+            norm_target_sum=1e4,
+            by_context=False,
+        )
+        assert "normalized_log1p" in adata.layers
+        assert rows[0]["layer_key"] == "normalized_log1p"
