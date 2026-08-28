@@ -2,7 +2,7 @@
 
 [![Code analysis](https://github.com/microsoft/mechanisms_matter/actions/workflows/code-analysis.yml/badge.svg)](https://github.com/microsoft/mechanisms_matter/actions/workflows/code-analysis.yml)
 
-This repository contains the code accompanying our paper [Mechanisms Matter: Transportability of Cellular Perturbation Effects](https://www.biorxiv.org/content/10.64898/2026.05.08.723625v2), accepted at the 2026 Workshop on Generative and Agentic AI for Biology (ICML 2026). The project studies when perturbation effects can be transported across biological contexts using causal simulations, real Perturb-seq datasets, simple baselines, deep learning models, and diversity-aware evaluation metrics.
+This repository contains the code to replicate experiments in our paper[Mechanisms Matter: Transportability of Cellular Perturbation Effects](https://www.biorxiv.org/content/10.64898/2026.05.08.723625v2), accepted at the 2026 Workshop on Generative and Agentic AI for Biology (ICML 2026). The project studies when perturbation effects can be transported across biological contexts using causal simulations, real Perturb-seq datasets, simple baselines, deep learning models, and diversity-aware evaluation metrics.
 
 To cite the paper:
 
@@ -52,7 +52,7 @@ See the per-dataset README files under [`transportability/src/perturbations/data
 
 ### Simulator Validation
 
-[The simulator-validation analysis](transportability/src/perturbations/analyses/simulator_validation/generate_statistics.py) compares real and synthetic data using gene-wise and cell-wise marginal statistics, gene-pair correlations, and TRADE ([Nadig et al. 2025](https://www.nature.com/articles/s41588-025-02169-3)) perturbation-effect statistics.
+[The simulator-validation analysis](transportability/src/perturbations/analyses/simulator_validation/generate_statistics.py) compares real and synthetic data using gene-wise and cell-wise marginal statistics, gene-pair correlations, and [TRADE](transportability/src/perturbations/metrics/perturbation_effect/trade.py) ([Nadig et al. 2025](https://www.nature.com/articles/s41588-025-02169-3)) perturbation-effect statistics.
 
 ## Context-Aware Splitting
 
@@ -77,7 +77,7 @@ The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) 
 
 The `perturbations` package provides evaluation metrics for perturbation models across three categories: perturbation effect, reconstruction, and gene selection. The [proposed Vendi score](transportability/src/perturbations/metrics/reconstruction/vendi_score.py) is used in two forms: a cell-level Vendi score for distributional reconstruction and a pseudobulk Vendi score for perturbation effects.
 
-The [Vendi sensitivity analysis](transportability/src/perturbations/analyses/simulator_validation/vendi_sensitivity.py) evaluates how stable both forms of the score are under cell subsampling and injected dropout or Gaussian noise.
+The [Vendi robustness analysis](transportability/src/perturbations/analyses/vendi_score/vendi_robustness.py) evaluates robustness under cell subsampling and injected dropout or Gaussian noise. The [`run_vendi`](transportability/src/perturbations/analyses/vendi_score/run_vendi.py) script computes dataset-level Vendi scores and split-half PDS-L1 for real and synthetic datasets.
 
 ## Prerequisites
 
