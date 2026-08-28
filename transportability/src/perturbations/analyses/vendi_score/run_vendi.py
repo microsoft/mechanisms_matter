@@ -372,7 +372,6 @@ def _base_result_row(
 def _compute_h5ad_vendi_score(
     *,
     spec: DatasetSpec,
-    obs_layer: str | None,
     counts_layer: str | None,
     batch_size: int,
     n_pca_components: int,
@@ -391,7 +390,7 @@ def _compute_h5ad_vendi_score(
 
         vendi_layer_key = _ensure_h5ad_layer(
             adata=adata,
-            obs_layer=obs_layer,
+            obs_layer=NORM_LAYER_KEY,
             counts_layer=counts_layer,
             norm_target_sum=norm_target_sum,
         )
@@ -438,7 +437,7 @@ def _compute_h5ad_vendi_score(
                 spec=spec,
                 obs=adata_slice.obs,
                 n_vars=adata_slice.n_vars,
-                reported_layer_key=obs_layer or "X",
+                reported_layer_key=NORM_LAYER_KEY,
                 batch_size=batch_size,
                 n_pca_components=n_pca_components,
                 sample_size=sample_size,
@@ -459,7 +458,6 @@ def _compute_h5ad_vendi_score(
 def _compute_cd4_vendi_score(
     *,
     spec: DatasetSpec,
-    obs_layer: str | None,
     batch_size: int,
     n_pca_components: int,
     sample_size: int,
@@ -470,7 +468,7 @@ def _compute_cd4_vendi_score(
     _require_existing_path(spec.dataset_path)
 
     runtime = CD4ChunkedDataset.from_manifest(spec.dataset_path)
-    vendi_layer_key = _cd4_vendi_layer(runtime, obs_layer)
+    vendi_layer_key = _cd4_vendi_layer(runtime, NORM_LAYER_KEY)
     validate_perturbation_targets_subset_from_obs(
         obs=runtime.obs,
         gene_names=runtime.var_names,
@@ -525,7 +523,7 @@ def _compute_cd4_vendi_score(
                 spec=spec,
                 obs=obs_slice,
                 n_vars=runtime.n_vars,
-                reported_layer_key=obs_layer or "X",
+                reported_layer_key=NORM_LAYER_KEY,
                 batch_size=batch_size,
                 n_pca_components=n_pca_components,
                 sample_size=sample_size,
@@ -549,7 +547,6 @@ def run_real_dataset_vendi_scores(
     *,
     output_dir: str = _DEFAULT_OUTPUT_DIR,
     dataset_labels: Sequence[str] | None = None,
-    obs_layer: str | None = NORM_LAYER_KEY,
     counts_layer: str | None = "counts",
     batch_size: int = 1024,
     n_pca_components: int = 50,
@@ -564,7 +561,6 @@ def run_real_dataset_vendi_scores(
     Args:
         output_dir: Directory where the result CSV should be written.
         dataset_labels: Dataset labels to evaluate, or ``None`` for all datasets.
-        obs_layer: Expression layer to evaluate, or ``None`` to use ``.X``.
         counts_layer: Count layer used only when building ``normalized_log1p`` for h5ad inputs.
         batch_size: Batch size passed to the Vendi scorer.
         n_pca_components: Number of PCA components used by the Vendi scorer.
@@ -596,7 +592,6 @@ def run_real_dataset_vendi_scores(
         if spec.is_cd4_chunked:
             spec_rows = _compute_cd4_vendi_score(
                 spec=spec,
-                obs_layer=obs_layer,
                 batch_size=int(batch_size),
                 n_pca_components=int(n_pca_components),
                 sample_size=int(sample_size),
@@ -606,7 +601,6 @@ def run_real_dataset_vendi_scores(
         else:
             spec_rows = _compute_h5ad_vendi_score(
                 spec=spec,
-                obs_layer=obs_layer,
                 counts_layer=counts_layer,
                 batch_size=int(batch_size),
                 n_pca_components=int(n_pca_components),
@@ -836,15 +830,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Dataset label(s) to evaluate. Omit to run all configured datasets.",
     )
     parser.add_argument(
-        "--obs_layer",
-        type=str,
-        default=NORM_LAYER_KEY,
-        help=(
-            "Expression layer for Vendi/PDS, applied to both real and synthetic datasets. "
-            "Set to 'none' to use adata.X (raw counts for CausalDGP)."
-        ),
-    )
-    parser.add_argument(
         "--counts_layer",
         type=str,
         default="counts",
@@ -893,7 +878,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_real_dataset_vendi_scores(
             output_dir=args.output_dir,
             dataset_labels=args.dataset_label,
-            obs_layer=_parse_optional_layer(args.obs_layer),
             counts_layer=_parse_optional_layer(args.counts_layer),
             batch_size=int(args.batch_size),
             n_pca_components=int(args.n_pca_components),

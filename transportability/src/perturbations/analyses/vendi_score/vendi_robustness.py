@@ -7,10 +7,10 @@ diversity-aware metric is stable. This addresses the reviewer question of how
 sensitive the diversity metric is to dataset size and noise.
 
 Example:
-    python -m perturbations.analyses.simulator_validation.vendi_sensitivity \\
+    python -m perturbations.analyses.vendi_score.vendi_robustness \\
         --name norman19 \\
         --dataset-path data/norman19/norman19_processed.h5ad \\
-        --output-dir results/vendi_sensitivity
+        --output-dir results/vendi_robustness
 """
 
 # pyright: reportUnknownMemberType=false
@@ -37,7 +37,7 @@ from perturbations.metrics.reconstruction.vendi_score import (
 )
 from perturbations.util.anndata_util import fit_control_incremental_pca
 
-_DEFAULT_OUTPUT_DIR = "results/vendi_sensitivity"
+_DEFAULT_OUTPUT_DIR = "results/vendi_robustness"
 
 
 def _parse_float_list(text: str) -> list[float]:
@@ -541,8 +541,8 @@ def main() -> None:
     )
     summary = summarize_sensitivity(results)
 
-    results_path = output_dir / f"{name}_vendi_sensitivity.csv"
-    summary_path = output_dir / f"{name}_vendi_sensitivity_summary.csv"
+    results_path = output_dir / f"{name}_vendi_robustness.csv"
+    summary_path = output_dir / f"{name}_vendi_robustness_summary.csv"
     results.to_csv(results_path, index=False)
     summary.to_csv(summary_path, index=False)
     print(f"\nWrote raw results to {results_path}")

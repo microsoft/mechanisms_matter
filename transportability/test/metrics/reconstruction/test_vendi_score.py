@@ -331,7 +331,6 @@ class TestRealDataLayerSelection:
         )
         rows = rv._compute_h5ad_vendi_score(
             spec=spec,
-            obs_layer="normalized_log1p",
             counts_layer="counts",
             batch_size=32,
             n_pca_components=3,
@@ -368,7 +367,6 @@ class TestRealDataLayerSelection:
         )
         rows = rv._compute_h5ad_vendi_score(
             spec=spec,
-            obs_layer="normalized_log1p",
             counts_layer="counts",
             batch_size=32,
             n_pca_components=3,
