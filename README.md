@@ -71,7 +71,10 @@ The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) 
 | CPA | [CPA](https://github.com/theislab/cpa) |
 | GEARS | [GEARS](https://github.com/snap-stanford/GEARS) |
 | STATE | [STATE](https://github.com/ArcInstitute/state)  |
+| STATE (Geneformer) | [STATE](https://github.com/ArcInstitute/state) + [Geneformer](https://huggingface.co/ctheodoris/Geneformer) |
 | scLDM | [scLDM](https://github.com/czi-ai/scldm) |
+
+STATE (Geneformer) uses [Geneformer](https://huggingface.co/ctheodoris/Geneformer) cell embeddings as the basal cell state. See [`geneformer_env/`](transportability/geneformer_env/) for extraction setup.
 
 ## Metrics
 

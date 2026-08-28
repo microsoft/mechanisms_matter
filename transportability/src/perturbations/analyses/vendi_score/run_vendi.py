@@ -830,6 +830,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Dataset label(s) to evaluate. Omit to run all configured datasets.",
     )
     parser.add_argument(
+        "--obs_layer",
+        type=str,
+        default=NORM_LAYER_KEY,
+        help=(
+            "Expression layer for Vendi/PDS, applied to both real and synthetic datasets. "
+            "Set to 'none' to use adata.X (raw counts for CausalDGP)."
+        ),
+    )
+    parser.add_argument(
         "--counts_layer",
         type=str,
         default="counts",
@@ -878,6 +887,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_real_dataset_vendi_scores(
             output_dir=args.output_dir,
             dataset_labels=args.dataset_label,
+            obs_layer=_parse_optional_layer(args.obs_layer),
             counts_layer=_parse_optional_layer(args.counts_layer),
             batch_size=int(args.batch_size),
             n_pca_components=int(args.n_pca_components),
