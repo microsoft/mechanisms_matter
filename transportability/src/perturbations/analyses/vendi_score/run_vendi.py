@@ -664,7 +664,14 @@ def _compute_synthetic_vendi_score(
         normalized_layer_key=NORM_LAYER_KEY,
     )
 
-    layer_key: str | None = None  # use normalized .X
+    # causalDGP stores raw counts in .X; always score on the normalized layer.
+    layer_key: str = NORM_LAYER_KEY
+    if layer_key not in adata.layers:
+        raise KeyError(
+            f"CausalDGP dataset is missing the '{NORM_LAYER_KEY}' layer. "
+            f"Available layers: {sorted(adata.layers)}."
+        )
+
     slices: list[tuple[str, ad.AnnData]] = []
     if by_context and _SYNTHETIC_CONTEXT_AXIS in adata.obs.columns:
         for ctx_val in sorted(adata.obs[_SYNTHETIC_CONTEXT_AXIS].astype(str).unique()):
@@ -719,7 +726,7 @@ def _compute_synthetic_vendi_score(
             "n_contexts": len(ctx_values),
             "context_axis": _SYNTHETIC_CONTEXT_AXIS,
             "context_values": ";".join(ctx_values),
-            "layer_key": "X",
+            "layer_key": layer_key,
             "ac_batch_size": batch_size,
             "n_pca_components": n_pca_components,
             "sample_size": sample_size,
@@ -749,7 +756,25 @@ def run_synthetic_vendi_scores(
     random_state: int = 0,
     by_context: bool = True,
 ) -> str:
-    """Compute Vendi + PDS for CausalDGP under each diversity scenario."""
+    """
+    Compute Vendi + PDS for CausalDGP under each diversity scenario.
+
+    Args:
+        output_dir: Directory where the result CSV should be written.
+        diversity_types: Diversity types to generate, or ``None`` for all of them.
+        n_genes: Number of genes to simulate.
+        n_control: Number of control cells.
+        n_per_perturbation: Number of cells per perturbation.
+        n_perturbations: Number of perturbations.
+        batch_size: Batch size passed to the Vendi scorer.
+        n_pca_components: Number of PCA components used by the Vendi scorer.
+        sample_size: Number of cells sampled for MMD bandwidth estimation.
+        random_state: Random seed, also used as the CausalDGP generator seed.
+        by_context: When True, score each context value separately.
+
+    Returns:
+        Path to the written result CSV.
+    """
     if diversity_types is None:
         diversity_types = list(_DIVERSITY_TYPES)
     for dt in diversity_types:
@@ -814,7 +839,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--obs_layer",
         type=str,
         default=NORM_LAYER_KEY,
-        help="Expression layer for Vendi. Set to 'none' to use adata.X.",
+        help=(
+            "Expression layer for Vendi/PDS, applied to both real and synthetic datasets. "
+            "Set to 'none' to use adata.X (raw counts for CausalDGP)."
+        ),
     )
     parser.add_argument(
         "--counts_layer",
