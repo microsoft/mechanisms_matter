@@ -77,7 +77,7 @@ The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) 
 
 The `perturbations` package provides evaluation metrics for perturbation models across three categories: perturbation effect, reconstruction, and gene selection. The [proposed Vendi score](transportability/src/perturbations/metrics/reconstruction/vendi_score.py) is used in two forms: a cell-level Vendi score for distributional reconstruction and a pseudobulk Vendi score for perturbation effects.
 
-The [Vendi robustness analysis](transportability/src/perturbations/analyses/vendi_score/vendi_robustness.py) evaluates robustness under cell subsampling and injected dropout or Gaussian noise. The [`run_vendi`](transportability/src/perturbations/analyses/vendi_score/run_vendi.py) script computes dataset-level Vendi scores and split-half PDS-L1 for real and synthetic datasets.
+The [Vendi robustness analysis](transportability/src/perturbations/analyses/vendi_score/vendi_robustness.py) evaluates robustness under cell subsampling and injected dropout or Gaussian noise. The [effective-rank validation](transportability/src/perturbations/analyses/vendi_score/vendi_effective_rank.py) confirms that the Vendi score tracks perturbation diversity across randomly simulated datasets. The [`run_vendi`](transportability/src/perturbations/analyses/vendi_score/run_vendi.py) script computes dataset-level Vendi scores and split-half PDS-L1 for real and synthetic datasets.
 
 ## Prerequisites
 

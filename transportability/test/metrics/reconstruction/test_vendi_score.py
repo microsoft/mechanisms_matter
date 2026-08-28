@@ -1,695 +1,379 @@
-from itertools import pairwise
+"""Unit tests for the run_vendi Vendi + PDS scoring pipeline helpers."""
+
+from __future__ import annotations
+
+import math
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
-from anndata.experimental import AnnCollection
-from sklearn.decomposition import PCA, IncrementalPCA
+from scipy import sparse
 
-from perturbations.metrics.reconstruction.distance_util import adaptive_gamma
-from perturbations.metrics.reconstruction.vendi_score import (
-    estimate_vendi_outer_sigma_squared,
-    estimate_vendi_pseudobulk_sigma_squared,
-    fit_vendi_pseudobulk_pca,
-    vendi_score,
-    vendi_score_pseudobulk,
+from perturbations.analyses.vendi_score.run_vendi import (
+    _OUTPUT_COLUMNS,
+    DatasetSpec,
+    _base_result_row,
+    _split_half_pds,
 )
 
 
-def _adata(labels: list[int], n_features: int = 16, seed: int = 0) -> ad.AnnData:
-    rng = np.random.default_rng(seed)
-    X = rng.normal(size=(len(labels), n_features)).astype(np.float32)
-    obs = pd.DataFrame(
-        {"perturbation": labels},
-        index=[f"cell_{i}" for i in range(len(labels))],
-    )
-    var = pd.DataFrame(index=[f"g{i}" for i in range(n_features)])
-    return ad.AnnData(X=X, obs=obs, var=var)
-
-
-def _calibrated_cell_data(
-    separation: float = 1.0,
-    n_perturbations: int = 5,
-    n_controls: int = 400,
-    n_cells: int = 80,
-    n_features: int = 10,
+def _make_adata(
+    n_cells_per_group: int,
+    n_genes: int,
+    perturbations: list[str],
+    contexts: list[str] | None = None,
     seed: int = 0,
-) -> tuple[ad.AnnData, IncrementalPCA, float, float]:
+) -> ad.AnnData:
+    """Build a minimal AnnData with distinct perturbation profiles."""
     rng = np.random.default_rng(seed)
-    controls = rng.normal(size=(n_controls, n_features))
-    pca_model = IncrementalPCA(n_components=n_features).fit(controls)
-    directions = pca_model.components_[:n_perturbations]
-    groups = [
-        rng.normal(size=(n_cells, n_features)) + separation * directions[group_idx]
-        for group_idx in range(n_perturbations)
-    ]
+    n_groups = len(perturbations)
+    n_total = n_cells_per_group * n_groups
+    X = np.empty((n_total, n_genes), dtype=np.float32)
+    labels: list[str] = []
+    ctx_labels: list[str] = []
+    for i, pert in enumerate(perturbations):
+        start = i * n_cells_per_group
+        end = start + n_cells_per_group
+        X[start:end] = rng.normal(loc=i * 2.0, scale=0.1, size=(n_cells_per_group, n_genes))
+        labels.extend([pert] * n_cells_per_group)
+        if contexts is not None:
+            ctx_labels.extend([contexts[i % len(contexts)]] * n_cells_per_group)
 
-    matrix = np.vstack([controls, *groups]).astype(np.float32)
-    labels = np.concatenate(
-        [
-            np.repeat("control", n_controls),
-            np.concatenate(
-                [np.repeat(f"pert_{group_idx}", n_cells) for group_idx in range(n_perturbations)]
-            ),
-        ]
-    )
+    obs = pd.DataFrame({"perturbation": labels})
+    if ctx_labels:
+        obs["cell_line"] = ctx_labels
+    return ad.AnnData(X=X, obs=obs)
+
+
+# --- _split_half_pds tests ---
+
+
+class TestSplitHalfPds:
+    def test_returns_nan_with_fewer_than_two_non_control_perturbations(self) -> None:
+        adata = _make_adata(10, 5, ["control", "gene1"])
+        scores = _split_half_pds(adata, layer_key=None, control_label="control", random_state=0)
+        assert math.isnan(scores["pds_l1"])
+        assert math.isnan(scores["pds_l2"])
+        assert math.isnan(scores["pds_cosine"])
+
+    def test_returns_nan_without_control_cells(self) -> None:
+        adata = _make_adata(10, 5, ["gene1", "gene2", "gene3"])
+        scores = _split_half_pds(adata, layer_key=None, control_label="control", random_state=0)
+        assert math.isnan(scores["pds_l1"])
+
+    def test_returns_finite_scores_with_distinct_perturbations(self) -> None:
+        adata = _make_adata(20, 10, ["control", "gene1", "gene2", "gene3"], seed=42)
+        scores = _split_half_pds(adata, layer_key=None, control_label="control", random_state=42)
+        for key in ("pds_l1", "pds_l2", "pds_cosine"):
+            assert np.isfinite(scores[key]), f"{key} should be finite"
+            assert 0.0 <= scores[key] <= 1.0, f"{key}={scores[key]} out of [0, 1]"
+
+    def test_symmetric_across_splits(self) -> None:
+        adata = _make_adata(40, 8, ["control", "gene1", "gene2", "gene3"], seed=7)
+        scores = _split_half_pds(adata, layer_key=None, control_label="control", random_state=7)
+        # Well-separated synthetic data yields perfect PDS (1.0).
+        assert 0.0 < scores["pds_l1"] <= 1.0
+
+    def test_uses_specified_layer(self) -> None:
+        adata = _make_adata(20, 5, ["control", "gene1", "gene2", "gene3"], seed=0)
+        adata.layers["custom"] = adata.X * 10.0
+        scores_x = _split_half_pds(adata, layer_key=None, control_label="control", random_state=0)
+        scores_layer = _split_half_pds(
+            adata, layer_key="custom", control_label="control", random_state=0
+        )
+        # Same relative structure scaled 10x — PDS should be identical.
+        np.testing.assert_allclose(scores_x["pds_l1"], scores_layer["pds_l1"], atol=1e-6)
+
+    def test_deterministic_with_same_seed(self) -> None:
+        adata = _make_adata(30, 6, ["control", "gene1", "gene2", "gene3"], seed=99)
+        a = _split_half_pds(adata, layer_key=None, control_label="control", random_state=5)
+        b = _split_half_pds(adata, layer_key=None, control_label="control", random_state=5)
+        assert a == b
+
+    def test_skips_perturbations_with_single_cell(self) -> None:
+        X = np.array([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]], dtype=np.float32)
+        obs = pd.DataFrame(
+            {"perturbation": ["control", "control", "gene1", "gene1", "gene2", "gene2", "gene3"]}
+        )
+        adata = ad.AnnData(X=X, obs=obs)
+        # gene3 has only 1 cell — should be skipped, leaving gene1 + gene2.
+        scores = _split_half_pds(adata, layer_key=None, control_label="control", random_state=0)
+        assert np.isfinite(scores["pds_l1"])
+
+    def test_handles_sparse_matrix(self) -> None:
+        """Real datasets and causalDGP output store expression as sparse CSR."""
+        dense = _make_adata(20, 10, ["control", "gene1", "gene2", "gene3"], seed=42)
+        adata = ad.AnnData(X=sparse.csr_matrix(dense.X), obs=dense.obs.copy())
+        scores = _split_half_pds(adata, layer_key=None, control_label="control", random_state=42)
+        for key in ("pds_l1", "pds_l2", "pds_cosine"):
+            assert np.isfinite(scores[key]), f"{key} should be finite for sparse input"
+
+    def test_sparse_matches_dense(self) -> None:
+        dense = _make_adata(20, 10, ["control", "gene1", "gene2", "gene3"], seed=42)
+        sparse_adata = ad.AnnData(X=sparse.csr_matrix(dense.X), obs=dense.obs.copy())
+        dense_scores = _split_half_pds(
+            dense, layer_key=None, control_label="control", random_state=42
+        )
+        sparse_scores = _split_half_pds(
+            sparse_adata, layer_key=None, control_label="control", random_state=42
+        )
+        for key in ("pds_l1", "pds_l2", "pds_cosine"):
+            np.testing.assert_allclose(dense_scores[key], sparse_scores[key], atol=1e-10)
+
+    def test_handles_sparse_anndata_view(self) -> None:
+        """Context slicing passes an AnnData view whose .X is a SparseCSRMatrixView."""
+        dense = _make_adata(20, 10, ["control", "gene1", "gene2", "gene3"], seed=3)
+        obs = dense.obs.copy()
+        # Interleave contexts within each perturbation so every context keeps all groups.
+        obs["cell_line"] = np.where(np.arange(obs.shape[0]) % 2 == 0, "c0", "c1")
+        adata = ad.AnnData(X=sparse.csr_matrix(dense.X), obs=obs)
+        view = adata[adata.obs["cell_line"].astype(str) == "c0"]
+        scores = _split_half_pds(view, layer_key=None, control_label="control", random_state=3)
+        assert np.isfinite(scores["pds_l1"])
+
+
+# --- _base_result_row tests ---
+
+
+class TestBaseResultRow:
+    def _make_spec(self) -> DatasetSpec:
+        return DatasetSpec(
+            dataset="norman19",
+            dataset_variant=None,
+            dataset_label="norman19",
+            dataset_path="unused",
+        )
+
+    def test_contains_all_output_columns(self) -> None:
+        obs = pd.DataFrame({"perturbation": ["control", "gene1"], "cell_line": ["K562", "K562"]})
+        row = _base_result_row(
+            spec=self._make_spec(),
+            obs=obs,
+            n_vars=100,
+            reported_layer_key="X",
+            batch_size=64,
+            n_pca_components=50,
+            sample_size=500,
+            random_state=0,
+            execution_time_seconds=1.5,
+            score=3.14,
+        )
+        for col in _OUTPUT_COLUMNS:
+            if col in ("pds_l1", "pds_l2", "pds_cosine", "vendi_score_pseudobulk"):
+                continue  # added by callers, not _base_result_row
+            assert col in row, f"Missing column: {col}"
+
+    def test_scope_defaults_to_all(self) -> None:
+        obs = pd.DataFrame({"perturbation": ["control", "gene1"], "cell_line": ["K562", "K562"]})
+        row = _base_result_row(
+            spec=self._make_spec(),
+            obs=obs,
+            n_vars=10,
+            reported_layer_key="X",
+            batch_size=32,
+            n_pca_components=50,
+            sample_size=100,
+            random_state=0,
+            execution_time_seconds=0.0,
+            score=1.0,
+        )
+        assert row["scope"] == "all"
+
+    def test_non_control_perturbation_count(self) -> None:
+        obs = pd.DataFrame(
+            {
+                "perturbation": ["control", "control", "gene1", "gene2"],
+                "cell_line": ["K562"] * 4,
+            }
+        )
+        row = _base_result_row(
+            spec=self._make_spec(),
+            obs=obs,
+            n_vars=5,
+            reported_layer_key="X",
+            batch_size=32,
+            n_pca_components=50,
+            sample_size=100,
+            random_state=0,
+            execution_time_seconds=0.0,
+            score=2.0,
+        )
+        assert row["n_total_perturbations"] == 2
+
+
+# --- Output columns contract ---
+
+
+def test_output_columns_include_pds_and_scope() -> None:
+    assert "scope" in _OUTPUT_COLUMNS
+    assert "pds_l1" in _OUTPUT_COLUMNS
+    assert "pds_l2" in _OUTPUT_COLUMNS
+    assert "pds_cosine" in _OUTPUT_COLUMNS
+    assert "vendi_score_cell" in _OUTPUT_COLUMNS
+    assert "vendi_score_pseudobulk" in _OUTPUT_COLUMNS
+
+
+# --- Synthetic CausalDGP layer selection ---
+
+
+def _fake_causal_dgp_adata(seed: int = 0) -> ad.AnnData:
+    """Mimic causalDGP output: raw counts in .X, log-normalized in the layer."""
+    rng = np.random.default_rng(seed)
+    perts = ["control"] + [f"g{i}" for i in range(6)]
+    n_per, n_genes = 40, 12
+    counts = np.empty((n_per * len(perts), n_genes), dtype=np.float32)
+    labels: list[str] = []
+    for i, pert in enumerate(perts):
+        counts[i * n_per : (i + 1) * n_per] = rng.poisson(
+            lam=1.0 + 3.0 * i, size=(n_per, n_genes)
+        ).astype(np.float32)
+        labels.extend([pert] * n_per)
     obs = pd.DataFrame(
-        {"perturbation": labels},
-        index=[f"cell_{idx}" for idx in range(matrix.shape[0])],
+        {
+            "perturbation": labels,
+            "cell_line": np.tile(["0", "1"], len(labels) // 2).astype(str),
+        }
     )
-    var = pd.DataFrame(index=[f"g{idx}" for idx in range(n_features)])
-    data = ad.AnnData(X=matrix, obs=obs, var=var)
-    layer_key = "normalized"
-    data.layers[layer_key] = matrix.copy()
+    adata = ad.AnnData(X=counts, obs=obs)
+    totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
+    adata.layers["normalized_log1p"] = np.log1p(counts / totals * 1e4).astype(np.float32)
+    return adata
 
-    perturbation_cells = np.vstack(groups)
-    gamma = adaptive_gamma(pca_model.transform(perturbation_cells))
-    outer_sigma_squared = estimate_vendi_outer_sigma_squared(
-        ac=data,
-        gamma=gamma,
-        pca_model=pca_model,
-        layer_key=layer_key,
-        control_label="control",
-        n_splits=100,
-        random_state=seed,
+
+@pytest.fixture
+def patched_synthetic(monkeypatch: pytest.MonkeyPatch):
+    """Patch CausalDGP generation so layer selection can be tested cheaply."""
+    from perturbations.analyses.vendi_score import run_vendi as rv
+
+    monkeypatch.setattr(
+        rv, "load_parameter_estimation_inputs", lambda: {"all_theta": None, "gene_names": None}
     )
-    return data, pca_model, gamma, outer_sigma_squared
+    monkeypatch.setattr(rv, "causalDGP", lambda **kwargs: (_fake_causal_dgp_adata(), []))
+    return rv
 
 
-def _calibrated_pseudobulk_data(
-    n_perturbations: int = 5,
-    n_controls: int = 400,
-    n_cells: int = 80,
-    n_features: int = 10,
-    seed: int = 0,
-) -> tuple[ad.AnnData, np.ndarray, PCA, float]:
-    rng = np.random.default_rng(seed)
-    controls = rng.normal(size=(n_controls, n_features))
-    groups = [rng.normal(size=(n_cells, n_features)) for _ in range(n_perturbations)]
-    pseudobulk = np.vstack([group.mean(axis=0) for group in groups])
-
-    matrix = np.vstack([controls, *groups]).astype(np.float32)
-    labels = np.concatenate(
-        [
-            np.repeat("control", n_controls),
-            np.concatenate(
-                [np.repeat(f"pert_{group_idx}", n_cells) for group_idx in range(n_perturbations)]
-            ),
-        ]
-    )
-    data = ad.AnnData(
-        X=matrix,
-        obs=pd.DataFrame(
-            {"perturbation": labels},
-            index=[f"cell_{idx}" for idx in range(matrix.shape[0])],
-        ),
-        var=pd.DataFrame(index=[f"g{idx}" for idx in range(n_features)]),
-    )
-    data.layers["normalized"] = matrix.copy()
-
-    pca_model = fit_vendi_pseudobulk_pca(
-        pseudobulk,
-        n_pca_components=n_perturbations,
-        random_state=seed,
-    )
-    outer_sigma_squared = estimate_vendi_pseudobulk_sigma_squared(
-        ac=data,
-        pca_model=pca_model,
-        layer_key="normalized",
-        control_label="control",
-        n_splits=100,
-        random_state=seed,
-    )
-    return data, pseudobulk, pca_model, outer_sigma_squared
-
-
-# ---------------------------------------------------------------------------
-# vendi_score_pseudobulk
-# ---------------------------------------------------------------------------
-
-
-def test_pseudobulk_identical_rows_returns_one() -> None:
-    _, _, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(
-        n_features=8,
-        seed=1,
-    )
-    pseudobulk = np.ones((5, 8), dtype=np.float64)
-    reference = np.zeros((5, 8), dtype=np.float64)
-    reference[:, :5] = np.eye(5)
-    pca_model = fit_vendi_pseudobulk_pca(reference, n_pca_components=5)
-    assert (
-        vendi_score_pseudobulk(
-            pseudobulk,
-            pca_model=pca_model,
-            outer_sigma_squared=outer_sigma_squared,
-        )
-        == 1.0
-    )
-
-
-def test_pseudobulk_single_perturbation_returns_one() -> None:
-    pseudobulk = np.arange(8, dtype=np.float64).reshape(1, 8)
-    assert (
-        vendi_score_pseudobulk(
-            pseudobulk,
-            pca_model=None,
-            outer_sigma_squared=None,
-        )
-        == 1.0
-    )
-
-
-def test_pseudobulk_distinct_rows_bounded_by_count() -> None:
-    _, pseudobulk, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(
+def _score_kwargs(**overrides):
+    base = dict(
+        diversity_type="both",
+        n_genes=12,
+        n_control=40,
+        n_per_perturbation=40,
         n_perturbations=6,
-        n_features=20,
-        seed=3,
+        batch_size=32,
+        n_pca_components=3,
+        sample_size=64,
+        random_state=0,
+        by_context=False,
     )
-    score = vendi_score_pseudobulk(
-        pseudobulk,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    assert 1.0 <= score <= 6.0 + 1e-9
+    base.update(overrides)
+    return base
 
 
-def test_pseudobulk_multiple_distinct_rows_require_pca() -> None:
-    _, pseudobulk, _, outer_sigma_squared = _calibrated_pseudobulk_data(seed=11)
-    with pytest.raises(ValueError, match="pca_model is required"):
-        vendi_score_pseudobulk(
-            pseudobulk,
-            pca_model=None,
-            outer_sigma_squared=outer_sigma_squared,
+class TestSyntheticObsLayer:
+    def test_defaults_to_normalized_layer_not_raw_x(self, patched_synthetic) -> None:
+        rows = patched_synthetic._compute_synthetic_vendi_score(**_score_kwargs())
+        assert all(row["layer_key"] == "normalized_log1p" for row in rows)
+
+    def test_missing_normalized_layer_raises(self, patched_synthetic) -> None:
+        def _causal_dgp_no_norm(**kwargs):
+            adata = _fake_causal_dgp_adata()
+            del adata.layers["normalized_log1p"]
+            return adata, []
+
+        patched_synthetic.causalDGP = _causal_dgp_no_norm
+        with pytest.raises(KeyError, match="normalized_log1p"):
+            patched_synthetic._compute_synthetic_vendi_score(**_score_kwargs())
+
+
+# --- Real-data layer selection ---
+
+
+def _make_real_adata() -> ad.AnnData:
+    """Build a minimal AnnData mimicking a real dataset with counts + normalized layer."""
+    rng = np.random.default_rng(0)
+    n_per, n_genes = 20, 8
+    perts = ["control", "gene1", "gene2", "gene3"]
+    counts = np.empty((n_per * len(perts), n_genes), dtype=np.float32)
+    labels: list[str] = []
+    for i, p in enumerate(perts):
+        counts[i * n_per : (i + 1) * n_per] = rng.poisson(
+            lam=2.0 + 3.0 * i, size=(n_per, n_genes)
+        ).astype(np.float32)
+        labels.extend([p] * n_per)
+    obs = pd.DataFrame({"perturbation": labels, "cell_line": ["K562"] * len(labels)})
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
+    adata = ad.AnnData(X=counts.copy(), obs=obs, var=var)
+    adata.layers["counts"] = counts.copy()
+    totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
+    adata.layers["normalized_log1p"] = np.log1p(counts / totals * 1e4).astype(np.float32)
+    return adata
+
+
+class TestRealDataLayerSelection:
+    def test_h5ad_defaults_to_normalized_log1p(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from perturbations.analyses.vendi_score import run_vendi as rv
+
+        adata = _make_real_adata()
+        monkeypatch.setattr(rv, "load_real_dataset", lambda dataset_path: (adata, {}))
+        monkeypatch.setattr(
+            rv,
+            "validate_perturbation_targets_subset_from_obs",
+            lambda obs, gene_names, control_label: None,
         )
+        monkeypatch.setattr(rv, "_require_existing_path", lambda path: None)
 
-
-def test_pseudobulk_multiple_distinct_rows_require_sigma() -> None:
-    _, pseudobulk, pca_model, _ = _calibrated_pseudobulk_data(seed=12)
-    with pytest.raises(ValueError, match="outer_sigma_squared must be finite"):
-        vendi_score_pseudobulk(
-            pseudobulk,
-            pca_model=pca_model,
-            outer_sigma_squared=None,
+        spec = DatasetSpec(
+            dataset="norman19",
+            dataset_variant=None,
+            dataset_label="norman19",
+            dataset_path="fake.h5ad",
         )
-
-
-def test_pseudobulk_zero_separation_and_monotonicity() -> None:
-    n_perturbations = 5
-    _, base_pseudobulk, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(
-        n_perturbations=n_perturbations,
-        seed=13,
-    )
-    scores = [
-        vendi_score_pseudobulk(
-            base_pseudobulk + separation * pca_model.components_[:n_perturbations],
-            pca_model=pca_model,
-            outer_sigma_squared=outer_sigma_squared,
+        rows = rv._compute_h5ad_vendi_score(
+            spec=spec,
+            counts_layer="counts",
+            batch_size=32,
+            n_pca_components=3,
+            sample_size=32,
+            random_state=0,
+            norm_target_sum=1e4,
+            by_context=False,
         )
-        for separation in (0.0, 1.0, 2.0, 5.0, 500.0)
-    ]
+        assert len(rows) == 1
+        assert rows[0]["layer_key"] == "normalized_log1p"
+        assert np.isfinite(rows[0]["vendi_score_cell"])
 
-    assert scores[0] == pytest.approx(1.0, abs=0.25)
-    assert all(left < right for left, right in pairwise(scores))
-    assert scores[-1] == pytest.approx(n_perturbations, abs=0.25)
+    def test_h5ad_builds_normalized_layer_from_counts_when_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from perturbations.analyses.vendi_score import run_vendi as rv
 
+        adata = _make_real_adata()
+        del adata.layers["normalized_log1p"]
 
-def test_pseudobulk_control_row_is_excluded() -> None:
-    _, perturbations, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(seed=4)
-    control = np.full((1, perturbations.shape[1]), 100.0)
-    with_control = np.vstack([control, perturbations])
-
-    score_with_control = vendi_score_pseudobulk(
-        with_control,
-        control_idx=0,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    score_without_control = vendi_score_pseudobulk(
-        perturbations,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    assert score_with_control == pytest.approx(score_without_control)
-
-
-def test_pseudobulk_negative_control_idx() -> None:
-    _, perturbations, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(
-        n_perturbations=4,
-        seed=5,
-    )
-    control = np.full((1, 10), -50.0)
-    pseudobulk = np.vstack([perturbations, control])
-
-    score_neg = vendi_score_pseudobulk(
-        pseudobulk,
-        control_idx=-1,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    score_pos = vendi_score_pseudobulk(
-        pseudobulk,
-        control_idx=4,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    assert score_neg == pytest.approx(score_pos)
-
-
-def test_pseudobulk_reproducible() -> None:
-    _, pseudobulk, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(
-        n_perturbations=7,
-        seed=6,
-    )
-    kwargs = {
-        "pseudobulk": pseudobulk,
-        "pca_model": pca_model,
-        "outer_sigma_squared": outer_sigma_squared,
-    }
-    a = vendi_score_pseudobulk(**kwargs)
-    b = vendi_score_pseudobulk(**kwargs)
-    assert a == b
-
-
-def test_pseudobulk_rejects_non_2d() -> None:
-    _, _, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(seed=7)
-    with pytest.raises(ValueError, match="2D array"):
-        vendi_score_pseudobulk(
-            np.zeros(8),
-            pca_model=pca_model,
-            outer_sigma_squared=outer_sigma_squared,
+        monkeypatch.setattr(rv, "load_real_dataset", lambda dataset_path: (adata, {}))
+        monkeypatch.setattr(
+            rv,
+            "validate_perturbation_targets_subset_from_obs",
+            lambda obs, gene_names, control_label: None,
         )
+        monkeypatch.setattr(rv, "_require_existing_path", lambda path: None)
 
-
-def test_pseudobulk_rejects_non_finite() -> None:
-    _, _, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(seed=8)
-    bad = np.array([[1.0, np.nan], [2.0, 3.0]])
-    with pytest.raises(ValueError, match="non-finite"):
-        vendi_score_pseudobulk(
-            bad,
-            pca_model=pca_model,
-            outer_sigma_squared=outer_sigma_squared,
+        spec = DatasetSpec(
+            dataset="norman19",
+            dataset_variant=None,
+            dataset_label="norman19",
+            dataset_path="fake.h5ad",
         )
-
-
-def test_pseudobulk_pca_rejects_non_positive_components() -> None:
-    with pytest.raises(ValueError, match="positive integer"):
-        fit_vendi_pseudobulk_pca(np.eye(3, 4), n_pca_components=0)
-
-
-def test_pseudobulk_control_idx_out_of_bounds() -> None:
-    _, pseudobulk, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(seed=9)
-    with pytest.raises(IndexError, match="out of bounds"):
-        vendi_score_pseudobulk(
-            pseudobulk,
-            control_idx=20,
-            pca_model=pca_model,
-            outer_sigma_squared=outer_sigma_squared,
+        rows = rv._compute_h5ad_vendi_score(
+            spec=spec,
+            counts_layer="counts",
+            batch_size=32,
+            n_pca_components=3,
+            sample_size=32,
+            random_state=0,
+            norm_target_sum=1e4,
+            by_context=False,
         )
-
-
-def test_pseudobulk_empty_returns_nan() -> None:
-    _, _, pca_model, outer_sigma_squared = _calibrated_pseudobulk_data(seed=10)
-    assert np.isnan(
-        vendi_score_pseudobulk(
-            np.zeros((0, 4)),
-            pca_model=pca_model,
-            outer_sigma_squared=outer_sigma_squared,
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# vendi_score (cell-level)
-# ---------------------------------------------------------------------------
-
-
-def test_cell_level_counts_distinct_perturbations() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        separation=5.0,
-        seed=5,
-    )
-    score = vendi_score(
-        ac=adata,
-        ac_batch_size=64,
-        layer_key="normalized",
-        control_label="control",
-        gamma=gamma,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    assert 1.0 <= score <= 5.0 + 1e-6
-
-
-@pytest.mark.filterwarnings("ignore:invalid value encountered in divide")
-def test_cell_level_identical_groups_returns_one() -> None:
-    rng = np.random.default_rng(6)
-    controls = rng.normal(size=(40, 8))
-    identical = np.ones((20, 8), dtype=np.float64)
-    matrix = np.vstack([controls, identical, identical, identical]).astype(np.float32)
-    labels = np.concatenate(
-        [np.repeat("control", 40), np.repeat(["pert_0", "pert_1", "pert_2"], 20)]
-    )
-    obs = pd.DataFrame(
-        {"perturbation": labels},
-        index=[f"cell_{i}" for i in range(len(labels))],
-    )
-    adata = ad.AnnData(
-        X=matrix,
-        obs=obs,
-        var=pd.DataFrame(index=[f"g{i}" for i in range(8)]),
-    )
-    adata.layers["normalized"] = matrix.copy()
-    pca_model = IncrementalPCA(n_components=4).fit(controls)
-    score = vendi_score(
-        ac=adata,
-        ac_batch_size=32,
-        layer_key="normalized",
-        control_label="control",
-        gamma=0.1,
-        pca_model=pca_model,
-        outer_sigma_squared=1.0,
-    )
-    assert score == pytest.approx(1.0)
-
-
-def test_cell_level_score_upper_bounded_by_num_perturbations() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        separation=5.0,
-        n_perturbations=3,
-        seed=12,
-    )
-    score = vendi_score(
-        ac=adata,
-        ac_batch_size=64,
-        layer_key="normalized",
-        control_label="control",
-        gamma=gamma,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    assert 1.0 <= score <= 3.0 + 1e-6
-
-
-def test_cell_level_zero_separation_and_monotonicity() -> None:
-    n_perturbations = 5
-    reference, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        separation=0.0,
-        n_perturbations=n_perturbations,
-        seed=13,
-    )
-    labels = np.asarray(reference.obs["perturbation"])
-    base_matrix = np.asarray(reference.layers["normalized"], dtype=np.float64)
-
-    scores: list[float] = []
-    for separation in (0.0, 1.0, 2.0, 5.0, 500.0):
-        data = reference.copy()
-        matrix = base_matrix.copy()
-        for group_idx in range(n_perturbations):
-            group_mask = labels == f"pert_{group_idx}"
-            matrix[group_mask] += separation * pca_model.components_[group_idx]
-        data.layers["normalized"] = matrix.astype(np.float32)
-
-        scores.append(
-            vendi_score(
-                ac=data,
-                layer_key="normalized",
-                control_label="control",
-                gamma=gamma,
-                pca_model=pca_model,
-                outer_sigma_squared=outer_sigma_squared,
-            )
-        )
-
-    assert scores[0] == pytest.approx(1.0, abs=0.25)
-    assert all(left < right for left, right in pairwise(scores))
-    assert scores[-1] == pytest.approx(n_perturbations, abs=0.25)
-
-
-def test_cell_level_excludes_control_label() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        separation=2.0,
-        n_perturbations=2,
-        seed=6,
-    )
-    common = {
-        "ac": adata,
-        "ac_batch_size": 64,
-        "layer_key": "normalized",
-        "gamma": gamma,
-        "pca_model": pca_model,
-        "outer_sigma_squared": outer_sigma_squared,
-    }
-    score_excl = vendi_score(control_label="control", **common)
-    score_none = vendi_score(control_label=None, **common)
-    assert score_none > score_excl
-
-
-def test_cell_level_reproducible() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(seed=7)
-    kwargs = {
-        "ac": adata,
-        "ac_batch_size": 64,
-        "layer_key": "normalized",
-        "control_label": "control",
-        "gamma": gamma,
-        "pca_model": pca_model,
-        "outer_sigma_squared": outer_sigma_squared,
-    }
-    a = vendi_score(**kwargs)
-    b = vendi_score(**kwargs)
-    assert a == pytest.approx(b)
-
-
-def test_cell_level_requires_perturbation_column() -> None:
-    rng = np.random.default_rng(8)
-    X = rng.normal(size=(10, 4)).astype(np.float32)
-    obs = pd.DataFrame({"other": list(range(10))}, index=[f"c{i}" for i in range(10)])
-    adata = ad.AnnData(X=X, obs=obs)
-    with pytest.raises(KeyError, match="perturbation"):
-        vendi_score(adata, outer_sigma_squared=1.0)
-
-
-def test_cell_level_no_perturbations_returns_nan() -> None:
-    labels = [-1] * 20
-    adata = _adata(labels, seed=9)
-    assert np.isnan(
-        vendi_score(
-            adata,
-            ac_batch_size=64,
-            control_label=-1,
-            outer_sigma_squared=None,
-        )
-    )
-
-
-def test_cell_level_single_perturbation_returns_one_without_calibration() -> None:
-    labels = [-1] * 20 + [0] * 20
-    adata = _adata(labels, seed=10)
-    assert (
-        vendi_score(
-            adata,
-            control_label=-1,
-            gamma=None,
-            pca_model=None,
-            outer_sigma_squared=None,
-        )
-        == 1.0
-    )
-
-
-@pytest.mark.filterwarnings("ignore:invalid value encountered in divide")
-def test_cell_level_uses_layer_when_layer_key_given() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        separation=2.0,
-        n_perturbations=3,
-        seed=20,
-    )
-    adata.layers["flat"] = np.ones_like(adata.layers["normalized"])
-    common = {
-        "ac": adata,
-        "control_label": "control",
-        "gamma": gamma,
-        "pca_model": pca_model,
-        "outer_sigma_squared": outer_sigma_squared,
-    }
-    from_normalized = vendi_score(layer_key="normalized", **common)
-    from_flat = vendi_score(layer_key="flat", **common)
-    assert from_normalized > 1.5
-    assert from_flat == pytest.approx(1.0)
-
-
-def test_cell_level_explicit_gamma_skips_estimation() -> None:
-    adata, pca_model, _, outer_sigma_squared = _calibrated_cell_data(
-        n_perturbations=3,
-        seed=22,
-    )
-    kwargs = {
-        "ac": adata,
-        "layer_key": "normalized",
-        "control_label": "control",
-        "gamma": 0.05,
-        "pca_model": pca_model,
-        "outer_sigma_squared": outer_sigma_squared,
-    }
-    a = vendi_score(**kwargs)
-    b = vendi_score(**kwargs)
-    assert a == pytest.approx(b)
-    assert 1.0 <= a <= 3.0 + 1e-6
-
-
-def test_cell_level_accepts_precomputed_pca_model() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        n_perturbations=2,
-        seed=23,
-    )
-    score = vendi_score(
-        ac=adata,
-        layer_key="normalized",
-        control_label="control",
-        gamma=gamma,
-        pca_model=pca_model,
-        outer_sigma_squared=outer_sigma_squared,
-    )
-    assert 1.0 <= score <= 2.0 + 1e-6
-
-
-def test_cell_level_anncollection_matches_anndata() -> None:
-    adata, pca_model, gamma, outer_sigma_squared = _calibrated_cell_data(
-        n_perturbations=3,
-        seed=24,
-    )
-    collection = AnnCollection([adata])
-    common = {
-        "ac_batch_size": 64,
-        "layer_key": "normalized",
-        "control_label": "control",
-        "gamma": gamma,
-        "pca_model": pca_model,
-        "outer_sigma_squared": outer_sigma_squared,
-    }
-    from_adata = vendi_score(ac=adata, **common)
-    from_collection = vendi_score(ac=collection, **common)
-    assert from_collection == pytest.approx(from_adata, rel=1e-6)
-
-
-def _tight_cluster_dataset(
-    n_perturbations: int,
-    n_features: int = 20,
-    n_cells: int = 60,
-    mean_scale: float = 5.0,
-    within_scale: float = 1e-3,
-    seed: int = 0,
-) -> tuple[ad.AnnData, np.ndarray]:
-    """
-    Build matched cell-level and pseudobulk data for tight clusters.
-
-    Each perturbation (plus a control at row 0 / label -1) is a tight Gaussian
-    cluster around a distinct random mean. Returns the AnnData and the
-    corresponding pseudobulk matrix (control row first).
-    """
-    rng = np.random.default_rng(seed)
-    means = rng.normal(size=(n_perturbations, n_features)) * mean_scale
-    labels: list[int] = []
-    blocks: list[np.ndarray] = []
-    pseudobulk_rows: list[np.ndarray] = []
-
-    control = rng.normal(0.0, within_scale, size=(n_cells, n_features))
-    labels += [-1] * n_cells
-    blocks.append(control)
-    pseudobulk_rows.append(control.mean(axis=0))
-
-    for g in range(n_perturbations):
-        block = rng.normal(0.0, within_scale, size=(n_cells, n_features)) + means[g]
-        blocks.append(block)
-        labels += [g] * n_cells
-        pseudobulk_rows.append(block.mean(axis=0))
-
-    X = np.vstack(blocks).astype(np.float32)
-    obs = pd.DataFrame(
-        {"perturbation": labels},
-        index=[f"cell_{i}" for i in range(len(labels))],
-    )
-    var = pd.DataFrame(index=[f"g{i}" for i in range(n_features)])
-    adata = ad.AnnData(X=X, obs=obs, var=var)
-    return adata, np.vstack(pseudobulk_rows)
-
-
-def test_cell_level_and_pseudobulk_agree_on_diversity_ordering() -> None:
-    # For tight single-cluster perturbations the two metrics use different
-    # bandwidth heuristics, so their absolute values differ. They must still
-    # agree directionally: a low-diversity dataset (few clusters) scores below a
-    # high-diversity dataset (many clusters) under *both* metrics, and both stay
-    # within [1, n_perturbations].
-    low_adata, low_pca, low_gamma, low_sigma = _calibrated_cell_data(
-        separation=5.0,
-        n_perturbations=2,
-        seed=30,
-    )
-    high_adata, high_pca, high_gamma, high_sigma = _calibrated_cell_data(
-        separation=5.0,
-        n_perturbations=6,
-        seed=30,
-    )
-
-    def pseudobulk(data: ad.AnnData) -> np.ndarray:
-        labels = np.asarray(data.obs["perturbation"])
-        return np.vstack(
-            [
-                np.asarray(data.layers["normalized"])[labels == label].mean(axis=0)
-                for label in np.unique(labels)
-            ]
-        )
-
-    low_cell = vendi_score(
-        ac=low_adata,
-        layer_key="normalized",
-        control_label="control",
-        gamma=low_gamma,
-        pca_model=low_pca,
-        outer_sigma_squared=low_sigma,
-    )
-    high_cell = vendi_score(
-        ac=high_adata,
-        layer_key="normalized",
-        control_label="control",
-        gamma=high_gamma,
-        pca_model=high_pca,
-        outer_sigma_squared=high_sigma,
-    )
-    low_pb = pseudobulk(low_adata)
-    high_pb = pseudobulk(high_adata)
-    low_pbulk_pca = fit_vendi_pseudobulk_pca(low_pb, control_idx=0, n_pca_components=10)
-    high_pbulk_pca = fit_vendi_pseudobulk_pca(high_pb, control_idx=0, n_pca_components=10)
-    low_pbulk_sigma = estimate_vendi_pseudobulk_sigma_squared(
-        ac=low_adata,
-        pca_model=low_pbulk_pca,
-        layer_key="normalized",
-    )
-    high_pbulk_sigma = estimate_vendi_pseudobulk_sigma_squared(
-        ac=high_adata,
-        pca_model=high_pbulk_pca,
-        layer_key="normalized",
-    )
-    low_pbulk = vendi_score_pseudobulk(
-        low_pb,
-        control_idx=0,
-        pca_model=low_pbulk_pca,
-        outer_sigma_squared=low_pbulk_sigma,
-    )
-    high_pbulk = vendi_score_pseudobulk(
-        high_pb,
-        control_idx=0,
-        pca_model=high_pbulk_pca,
-        outer_sigma_squared=high_pbulk_sigma,
-    )
-
-    # Both metrics rank higher diversity above lower diversity.
-    assert low_cell < high_cell
-    assert low_pbulk < high_pbulk
-
-    # Both stay within their theoretical [1, n] bounds.
-    assert 1.0 <= low_cell <= 2.0 + 1e-6
-    assert 1.0 <= high_cell <= 6.0 + 1e-6
-    assert 1.0 <= low_pbulk <= 2.0 + 1e-6
-    assert 1.0 <= high_pbulk <= 6.0 + 1e-6
+        assert "normalized_log1p" in adata.layers
+        assert rows[0]["layer_key"] == "normalized_log1p"
