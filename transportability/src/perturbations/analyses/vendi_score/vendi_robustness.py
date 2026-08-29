@@ -253,7 +253,7 @@ def run_sensitivity(
     n_pca_components: int = _DEFAULT_N_PCA_COMPONENTS,
     vendi_max_cells: int | None = None,
     seed: int = 0,
-    noise_target: str = "perturbed",
+    noise_target: str = "all",
     clip_gaussian_nonnegative: bool = True,
 ) -> pd.DataFrame:
     """
@@ -510,7 +510,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lognorm-layer", default=NORM_LAYER_KEY)
     parser.add_argument(
         "--noise-target",
-        default="perturbed",
+        default="all",
         choices=["all", "perturbed"],
         help="Inject noise into all cells or only non-control (perturbed) cells.",
     )
