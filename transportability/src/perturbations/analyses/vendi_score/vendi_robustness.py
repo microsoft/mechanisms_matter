@@ -17,6 +17,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 import anndata as ad
@@ -248,11 +249,11 @@ def run_sensitivity(
     lognorm_layer: str = NORM_LAYER_KEY,
     control_label: str = "control",
     noise_levels: list[float] | None = None,
-    n_seeds: int = 5,
+    n_seeds: int = 10,
     n_pca_components: int = _DEFAULT_N_PCA_COMPONENTS,
     vendi_max_cells: int | None = None,
     seed: int = 0,
-    noise_target: str = "all",
+    noise_target: str = "perturbed",
     clip_gaussian_nonnegative: bool = True,
 ) -> pd.DataFrame:
     """
@@ -329,11 +330,20 @@ def run_sensitivity(
         s: np.random.default_rng(seed + s).standard_normal(size=base_dense.shape)
         for s in range(n_seeds)
     }
+    total_iterations = len(noise_levels) * n_seeds
+    iteration = 0
     for level in noise_levels:
         # `level` is alpha (noise-to-signal std ratio); the fraction of total
         # variance that is noise is alpha^2 / (1 + alpha^2).
         variance_fraction = (level**2) / (1.0 + level**2)
         for s in range(n_seeds):
+            iteration += 1
+            # Liveness signal: the sweep otherwise prints nothing until it finishes.
+            print(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {name}: noise sweep "
+                f"{iteration}/{total_iterations} (alpha={level:g}, seed={s})",
+                flush=True,
+            )
             rng = np.random.default_rng(seed + s)
             noised = _inject_noise(
                 base,
