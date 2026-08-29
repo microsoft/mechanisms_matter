@@ -25,7 +25,10 @@ pipeline.
 
 from __future__ import annotations
 
+import multiprocessing
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -178,6 +181,7 @@ def deseq2_effect_sizes(
     control_label: str = "control",
     batch_key: str | None = None,
     quiet: bool = True,
+    n_cpus: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Run PyDESeq2 for each perturbation versus control on pseudobulk samples.
@@ -195,6 +199,7 @@ def deseq2_effect_sizes(
         batch_key: Optional ``obs`` column to block on in the design (e.g. real
             batches). Ignored when it has fewer than two levels.
         quiet: Whether to suppress PyDESeq2 progress output.
+        n_cpus: Number of CPUs PyDESeq2 may use. ``None`` uses its default.
 
     Returns:
         Mapping ``perturbation -> DataFrame`` indexed by gene with columns
@@ -240,6 +245,7 @@ def deseq2_effect_sizes(
         design=design,
         ref_level=["condition", safe[control_label]],
         quiet=quiet,
+        n_cpus=n_cpus,
     )
     dds.deseq2()
 
@@ -253,6 +259,7 @@ def deseq2_effect_sizes(
             dds,
             contrast=["condition", safe[lab], safe[control_label]],
             quiet=quiet,
+            n_cpus=n_cpus,
         )
         stats.summary()
         df = stats.results_df
@@ -375,7 +382,8 @@ def transcriptome_wide_impact(
 
     Returns:
         Dict with ``transcriptome_wide_impact`` (deconvolved variance),
-        ``pi_deg`` (effective number of DE genes), ``observed_variance``,
+        ``sqrt_transcriptome_wide_impact`` (its square root), ``pi_deg``
+        (effective number of DE genes), ``observed_variance``,
         ``mean_sampling_variance`` and ``n_genes``.
     """
     lfc = np.asarray(lfc, dtype=np.float64)
@@ -387,6 +395,7 @@ def transcriptome_wide_impact(
     if lfc.size == 0:
         return {
             "transcriptome_wide_impact": float("nan"),
+            "sqrt_transcriptome_wide_impact": float("nan"),
             "pi_deg": float("nan"),
             "observed_variance": float("nan"),
             "mean_sampling_variance": float("nan"),
@@ -408,11 +417,70 @@ def transcriptome_wide_impact(
 
     return {
         "transcriptome_wide_impact": impact,
+        "sqrt_transcriptome_wide_impact": float(np.sqrt(impact)),
         "pi_deg": pi_deg,
         "observed_variance": observed_variance,
         "mean_sampling_variance": mean_sampling_variance,
         "n_genes": float(lfc.size),
     }
+
+
+def _perturbation_effect_rows_for_context(
+    pseudobulk: AnnData,
+    context: str | None,
+    perturbation_key: str,
+    control_label: str,
+    context_key: str | None,
+    block_on_replicate: bool,
+    deg_fdr: float,
+    quiet: bool,
+    n_cpus: int | None,
+) -> list[dict[str, Any]]:
+    """Compute all perturbation-effect rows for one context."""
+    effects = deseq2_effect_sizes(
+        pseudobulk,
+        perturbation_key=perturbation_key,
+        control_label=control_label,
+        batch_key="replicate" if block_on_replicate else None,
+        quiet=quiet,
+        n_cpus=n_cpus,
+    )
+    rows: list[dict[str, Any]] = []
+    for pert, df in effects.items():
+        lfc = df["log2FoldChange"].to_numpy()
+        lfc_se = df["lfcSE"].to_numpy()
+        padj = df["padj"].to_numpy()
+        impact = transcriptome_wide_impact(lfc, lfc_se)
+        row: dict[str, Any] = {
+            perturbation_key: pert,
+            "transcriptome_wide_impact": impact["transcriptome_wide_impact"],
+            "sqrt_transcriptome_wide_impact": impact["sqrt_transcriptome_wide_impact"],
+            "pi_deg": impact["pi_deg"],
+            "observed_variance": impact["observed_variance"],
+            "n_deg": int(np.nansum(padj < deg_fdr)),
+            "mean_abs_lfc": float(np.nanmean(np.abs(lfc))) if lfc.size else float("nan"),
+            "n_genes": int(impact["n_genes"]),
+        }
+        if context_key is not None:
+            row[context_key] = context
+        rows.append(row)
+    return rows
+
+
+def _report_context_progress(
+    completed: int,
+    total: int,
+    context_key: str | None,
+    context: str | None,
+) -> None:
+    """Print a timestamped TRADE context-completion update."""
+    key = context_key or "context"
+    value = context if context is not None else "all"
+    print(
+        f"[{datetime.now():%Y-%m-%d %H:%M:%S}] TRADE: context "
+        f"{completed}/{total} complete ({key}={value})",
+        flush=True,
+    )
 
 
 def perturbation_effect_statistics(
@@ -427,6 +495,7 @@ def perturbation_effect_statistics(
     deg_fdr: float = 0.05,
     seed: int = 0,
     quiet: bool = True,
+    context_workers: int = 1,
 ) -> pd.DataFrame:
     """
     Compute per-perturbation effect-size statistics for one dataset.
@@ -452,12 +521,19 @@ def perturbation_effect_statistics(
         deg_fdr: FDR threshold for counting differentially expressed genes.
         seed: RNG seed for pseudo-replicate partitioning.
         quiet: Whether to suppress PyDESeq2 output.
+        context_workers: Maximum context-level worker processes. Values greater
+            than one run contexts in parallel and restrict each PyDESeq2 fit to
+            one CPU to avoid nested process pools.
 
     Returns:
         DataFrame with one row per perturbation (per context) and columns
         ``[perturbation_key, (context_key,) "transcriptome_wide_impact",
-        "pi_deg", "observed_variance", "n_deg", "mean_abs_lfc", "n_genes"]``.
+        "sqrt_transcriptome_wide_impact", "pi_deg", "observed_variance",
+        "n_deg", "mean_abs_lfc", "n_genes"]``.
     """
+    if context_workers < 1:
+        raise ValueError(f"context_workers must be >= 1, got {context_workers}.")
+
     pseudobulk = pseudobulk_replicates(
         adata,
         perturbation_key=perturbation_key,
@@ -474,37 +550,48 @@ def perturbation_effect_statistics(
     else:
         contexts = list(np.unique(np.asarray(pseudobulk.obs[context_key]).astype(str)))
 
-    rows: list[dict[str, Any]] = []
+    context_data: list[tuple[str | None, AnnData]] = []
     for ctx in contexts:
         sub = (
             pseudobulk
             if ctx is None
             else pseudobulk[np.asarray(pseudobulk.obs[context_key]).astype(str) == ctx].copy()
         )
-        effects = deseq2_effect_sizes(
-            sub,
-            perturbation_key=perturbation_key,
-            control_label=control_label,
-            batch_key="replicate" if batch_key is not None else None,
-            quiet=quiet,
-        )
-        for pert, df in effects.items():
-            lfc = df["log2FoldChange"].to_numpy()
-            lfc_se = df["lfcSE"].to_numpy()
-            padj = df["padj"].to_numpy()
-            impact = transcriptome_wide_impact(lfc, lfc_se)
-            row: dict[str, Any] = {
-                perturbation_key: pert,
-                "transcriptome_wide_impact": impact["transcriptome_wide_impact"],
-                "pi_deg": impact["pi_deg"],
-                "observed_variance": impact["observed_variance"],
-                "n_deg": int(np.nansum(padj < deg_fdr)),
-                "mean_abs_lfc": float(np.nanmean(np.abs(lfc))) if lfc.size else float("nan"),
-                "n_genes": int(impact["n_genes"]),
+        context_data.append((ctx, sub))
+
+    worker_count = min(context_workers, len(context_data))
+    common_args = (
+        perturbation_key,
+        control_label,
+        context_key,
+        batch_key is not None,
+        deg_fdr,
+        quiet,
+    )
+    row_groups: list[list[dict[str, Any]]] = [[] for _ in context_data]
+    if worker_count == 1:
+        for index, (ctx, sub) in enumerate(context_data):
+            row_groups[index] = _perturbation_effect_rows_for_context(sub, ctx, *common_args, None)
+            _report_context_progress(index + 1, len(context_data), context_key, ctx)
+    else:
+        spawn_context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=spawn_context) as executor:
+            future_contexts = {
+                executor.submit(
+                    _perturbation_effect_rows_for_context,
+                    sub,
+                    ctx,
+                    *common_args,
+                    1,
+                ): (index, ctx)
+                for index, (ctx, sub) in enumerate(context_data)
             }
-            if context_key is not None:
-                row[context_key] = ctx
-            rows.append(row)
+            for completed, future in enumerate(as_completed(future_contexts), start=1):
+                index, ctx = future_contexts[future]
+                row_groups[index] = future.result()
+                _report_context_progress(completed, len(context_data), context_key, ctx)
+
+    rows = [row for group in row_groups for row in group]
 
     return pd.DataFrame(rows)
 
@@ -568,8 +655,9 @@ def summarize_perturbation_statistics(
         stats: Per-perturbation DataFrame, e.g. from
             ``perturbation_effect_statistics``.
         metrics: Metric columns to summarize. Defaults to the effect columns
-            present among ``transcriptome_wide_impact``, ``n_deg`` and
-            ``mean_abs_lfc``.
+            present among ``transcriptome_wide_impact``,
+            ``sqrt_transcriptome_wide_impact``, ``pi_deg``,
+            ``observed_variance``, ``n_deg`` and ``mean_abs_lfc``.
         confidence: Confidence level for each interval.
         n_boot: Number of bootstrap resamples.
         seed: RNG seed for the bootstrap.
@@ -581,6 +669,7 @@ def summarize_perturbation_statistics(
     """
     default_metrics = [
         "transcriptome_wide_impact",
+        "sqrt_transcriptome_wide_impact",
         "pi_deg",
         "observed_variance",
         "n_deg",
