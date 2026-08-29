@@ -100,3 +100,45 @@ def test_context_parallelism_caps_workers_and_preserves_order(
 def test_context_workers_must_be_positive() -> None:
     with pytest.raises(ValueError, match="context_workers must be >= 1"):
         perturbation_effect_statistics(ad.AnnData(X=np.ones((1, 1))), context_workers=0)
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, None), ("", None), ("  ", None), ("32", 32)],
+)
+def test_deseq2_n_cpus_reads_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    expected: int | None,
+) -> None:
+    monkeypatch.delenv("DESEQ2_N_CPUS", raising=False)
+    if env_value is not None:
+        monkeypatch.setenv("DESEQ2_N_CPUS", env_value)
+
+    assert trade._deseq2_n_cpus() == expected
+
+
+def test_sequential_path_forwards_n_cpus_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The single-context path must honour DESEQ2_N_CPUS instead of hard-coding None."""
+    pseudobulk = ad.AnnData(
+        X=np.ones((2, 1)),
+        obs=pd.DataFrame(
+            {"perturbation": ["control", "gene_1"], "cell_line": ["a", "a"]},
+            index=["a_control", "a_gene_1"],
+        ),
+    )
+    monkeypatch.setattr(trade, "pseudobulk_replicates", lambda *args, **kwargs: pseudobulk)
+    monkeypatch.setattr(
+        trade,
+        "_perturbation_effect_rows_for_context",
+        lambda sub, context, *args: [{"cell_line": context, "n_cpus": args[-1]}],
+    )
+    monkeypatch.setenv("DESEQ2_N_CPUS", "16")
+
+    result = perturbation_effect_statistics(
+        pseudobulk,
+        context_key="cell_line",
+        context_workers=1,
+    )
+
+    assert result.to_dict("records") == [{"cell_line": "a", "n_cpus": 16}]

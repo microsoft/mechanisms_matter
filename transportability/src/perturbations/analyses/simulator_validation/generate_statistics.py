@@ -405,6 +405,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.3,
         help="Report the fraction of gene pairs with |correlation| above this value.",
     )
+    parser.add_argument(
+        "--context-filter",
+        default=None,
+        help=(
+            "Restrict the run to a single context value (e.g. 'RPE1'). Every block is "
+            "already computed within-context, so filtering first is equivalent to "
+            "running all contexts and keeping this one."
+        ),
+    )
     parser.add_argument("--output-dir", default=_DEFAULT_OUTPUT_DIR)
     return parser
 
@@ -458,6 +467,20 @@ def main() -> None:
 
     adata, name, context_key, counts_layer, batch_key = _load_dataset(args)
     print(f"Dataset {name!r}: {adata.n_obs} cells x {adata.n_vars} genes.")
+
+    context_filter = _none_if_empty(args.context_filter)
+    if context_filter is not None:
+        available = sorted(set(np.asarray(adata.obs[context_key]).astype(str)))
+        if context_filter not in available:
+            raise ValueError(
+                f"--context-filter {context_filter!r} not found in "
+                f"adata.obs[{context_key!r}]. Available: {available}"
+            )
+        adata = adata[np.asarray(adata.obs[context_key]).astype(str) == context_filter].copy()
+        print(
+            f"Filtered to {context_key}={context_filter!r}: "
+            f"{adata.n_obs} cells x {adata.n_vars} genes."
+        )
 
     summary_df, perturbation_effect_df = compute_validation_summary(
         adata,

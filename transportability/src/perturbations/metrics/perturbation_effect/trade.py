@@ -26,6 +26,8 @@ pipeline.
 from __future__ import annotations
 
 import multiprocessing
+import os
+import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -39,6 +41,17 @@ from pydeseq2.ds import DeseqStats
 from scipy import sparse
 
 from perturbations.util.anndata_util import get_matrix
+
+
+def _deseq2_n_cpus() -> int | None:
+    """
+    Read the ``DESEQ2_N_CPUS`` override for PyDESeq2 worker count.
+
+    Affects only how many loky workers PyDESeq2 spawns, never the numerics.
+    Capping it avoids the /dev/shm memmap blow-up that OOMs large-core nodes.
+    """
+    raw = os.environ.get("DESEQ2_N_CPUS", "").strip()
+    return int(raw) if raw else None
 
 
 def _counts_matrix(adata: AnnData, layer: str | None) -> sparse.csr_matrix | np.ndarray:
@@ -239,6 +252,16 @@ def deseq2_effect_sizes(
     if safe[control_label] not in valid_conditions:
         raise ValueError("Control condition has fewer than 2 pseudo-replicates.")
 
+    n_conditions = len(valid_conditions)
+    n_batches = len(set(metadata["batch"])) if "batch" in metadata.columns else 0
+    print(
+        f"[{datetime.now():%H:%M:%S}] [deseq2] pid={os.getpid()} "
+        f"samples={counts_df.shape[0]} genes={counts_df.shape[1]} "
+        f"conditions={n_conditions} batches={n_batches} design='{design}' "
+        f"n_cpus={n_cpus}",
+        flush=True,
+    )
+    fit_start = time.time()
     dds = DeseqDataSet(
         counts=counts_df,
         metadata=metadata,
@@ -248,13 +271,19 @@ def deseq2_effect_sizes(
         n_cpus=n_cpus,
     )
     dds.deseq2()
+    print(
+        f"[{datetime.now():%H:%M:%S}] [deseq2] pid={os.getpid()} "
+        f"fit complete in {(time.time() - fit_start) / 60:.1f} min",
+        flush=True,
+    )
 
+    contrast_targets = [
+        lab for lab in unique_labels if lab != control_label and safe[lab] in valid_conditions
+    ]
+    n_contrasts = len(contrast_targets)
+    contrast_start = time.time()
     results: dict[str, pd.DataFrame] = {}
-    for lab in unique_labels:
-        if lab == control_label:
-            continue
-        if safe[lab] not in valid_conditions:
-            continue
+    for done, lab in enumerate(contrast_targets, start=1):
         stats = DeseqStats(
             dds,
             contrast=["condition", safe[lab], safe[control_label]],
@@ -264,6 +293,14 @@ def deseq2_effect_sizes(
         stats.summary()
         df = stats.results_df
         results[lab] = df.loc[:, ["log2FoldChange", "lfcSE", "pvalue", "padj"]].copy()
+        if done % 50 == 0 or done == n_contrasts:
+            rate = (time.time() - contrast_start) / done
+            eta = (n_contrasts - done) * rate / 3600.0
+            print(
+                f"[{datetime.now():%H:%M:%S}] [deseq2] pid={os.getpid()} "
+                f"contrasts {done}/{n_contrasts} ({rate:.1f}s each, ETA {eta:.1f}h)",
+                flush=True,
+            )
 
     return results
 
@@ -571,7 +608,9 @@ def perturbation_effect_statistics(
     row_groups: list[list[dict[str, Any]]] = [[] for _ in context_data]
     if worker_count == 1:
         for index, (ctx, sub) in enumerate(context_data):
-            row_groups[index] = _perturbation_effect_rows_for_context(sub, ctx, *common_args, None)
+            row_groups[index] = _perturbation_effect_rows_for_context(
+                sub, ctx, *common_args, _deseq2_n_cpus()
+            )
             _report_context_progress(index + 1, len(context_data), context_key, ctx)
     else:
         spawn_context = multiprocessing.get_context("spawn")

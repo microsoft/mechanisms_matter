@@ -109,3 +109,61 @@ def test_validation_summary_forwards_workers_and_uses_control_cells(
 
     assert baseline_inputs == [["a_control"], ["a_control"], ["b_control"], ["b_control"]]
     assert observed_workers == [4]
+
+
+def test_context_filter_matches_the_same_context_from_a_joint_run() -> None:
+    """
+    Filtering to one context must equal running all contexts and keeping that one.
+
+    This is the property that lets a multi-context dataset be split into
+    independent per-context jobs without changing any result.
+    """
+    rng = np.random.default_rng(0)
+    contexts = ["K562", "RPE1"]
+    perturbations = ["control", "gene_1"]
+    cells_per_group = 20
+    n_genes = 8
+
+    blocks, rows = [], []
+    for offset, context in enumerate(contexts):
+        for perturbation in perturbations:
+            mean = 5.0 + 3.0 * offset + (2.0 if perturbation != "control" else 0.0)
+            blocks.append(rng.poisson(mean, size=(cells_per_group, n_genes)))
+            rows += [{"cell_line": context, "perturbation": perturbation}] * cells_per_group
+
+    adata = ad.AnnData(
+        X=np.vstack(blocks).astype(np.float64),
+        obs=pd.DataFrame(rows, index=[f"cell_{i}" for i in range(len(rows))]),
+    )
+
+    joint, _ = compute_validation_summary(
+        adata,
+        name="test",
+        context_key="cell_line",
+        include_gene_pairs=False,
+        include_perturbation_effects=False,
+        n_boot=25,
+    )
+    subset = adata[np.asarray(adata.obs["cell_line"]).astype(str) == "RPE1"].copy()
+    filtered, _ = compute_validation_summary(
+        subset,
+        name="test",
+        context_key="cell_line",
+        include_gene_pairs=False,
+        include_perturbation_effects=False,
+        n_boot=25,
+    )
+
+    joint_rpe1 = joint[joint["context"] == "RPE1"].reset_index(drop=True)
+
+    assert set(filtered["context"]) == {"RPE1"}
+    pd.testing.assert_frame_equal(joint_rpe1, filtered.reset_index(drop=True))
+
+
+def test_context_filter_rejects_an_unknown_context() -> None:
+    parser = generate_statistics._build_parser()
+    args = parser.parse_args(
+        ["--source", "real", "--dataset-path", "x.h5ad", "--context-filter", "HEK293"]
+    )
+
+    assert args.context_filter == "HEK293"
