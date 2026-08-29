@@ -253,7 +253,7 @@ def run_sensitivity(
     n_pca_components: int = _DEFAULT_N_PCA_COMPONENTS,
     vendi_max_cells: int | None = None,
     seed: int = 0,
-    noise_target: str = "perturbed",
+    noise_target: str = "all",
     clip_gaussian_nonnegative: bool = True,
 ) -> pd.DataFrame:
     """
@@ -285,31 +285,6 @@ def run_sensitivity(
     """
     noise_levels = noise_levels if noise_levels is not None else list(_DEFAULT_GAUSSIAN_LEVELS)
     rows: list[dict[str, object]] = []
-    pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
-        adata, lognorm_layer, control_label, n_pca_components, seed
-    )
-    observed_pseudobulk, observed_control_idx = _pseudobulk_matrix(
-        adata,
-        lognorm_layer,
-        control_label,
-    )
-    n_observed_perturbations = observed_pseudobulk.shape[0] - int(observed_control_idx is not None)
-    pseudobulk_pca_model = None
-    pseudobulk_sigma_squared = None
-    if n_observed_perturbations > 1:
-        pseudobulk_pca_model = fit_vendi_pseudobulk_pca(
-            observed_pseudobulk,
-            control_idx=observed_control_idx,
-            n_pca_components=n_pca_components,
-            random_state=seed,
-        )
-        pseudobulk_sigma_squared = estimate_vendi_pseudobulk_sigma_squared(
-            ac=adata,
-            pca_model=pseudobulk_pca_model,
-            layer_key=lognorm_layer,
-            control_label=control_label,
-            random_state=seed,
-        )
 
     # Noise sweep: fixed, optionally capped size; inject noise and recompute Vendi.
     base = adata
@@ -356,6 +331,35 @@ def run_sensitivity(
                 gaussian_gene_std=gaussian_gene_std,
                 clip_gaussian_nonnegative=clip_gaussian_nonnegative,
             )
+
+            # Re-estimate Vendi parameters from the noised data itself for every
+            # condition, so no iteration reuses another iteration's calibration.
+            pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
+                noised, lognorm_layer, control_label, n_pca_components, seed + s
+            )
+            observed_pseudobulk, observed_control_idx = _pseudobulk_matrix(
+                noised, lognorm_layer, control_label
+            )
+            n_observed_perturbations = observed_pseudobulk.shape[0] - int(
+                observed_control_idx is not None
+            )
+            pseudobulk_pca_model = None
+            pseudobulk_sigma_squared = None
+            if n_observed_perturbations > 1:
+                pseudobulk_pca_model = fit_vendi_pseudobulk_pca(
+                    observed_pseudobulk,
+                    control_idx=observed_control_idx,
+                    n_pca_components=n_pca_components,
+                    random_state=seed + s,
+                )
+                pseudobulk_sigma_squared = estimate_vendi_pseudobulk_sigma_squared(
+                    ac=noised,
+                    pca_model=pseudobulk_pca_model,
+                    layer_key=lognorm_layer,
+                    control_label=control_label,
+                    random_state=seed + s,
+                )
+
             vendi_cell, vendi_pseudobulk, pds_l1 = _compute_scores(
                 noised,
                 lognorm_layer,
@@ -506,7 +510,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lognorm-layer", default=NORM_LAYER_KEY)
     parser.add_argument(
         "--noise-target",
-        default="perturbed",
+        default="all",
         choices=["all", "perturbed"],
         help="Inject noise into all cells or only non-control (perturbed) cells.",
     )
