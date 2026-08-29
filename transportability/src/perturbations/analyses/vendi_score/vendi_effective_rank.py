@@ -4,7 +4,8 @@ Validate Vendi score effective-rank tracking with DirectDGP.
 Generates 100 randomly simulated datasets using DirectDGP-specific parameters
 sampled from ``PARAM_RANGES`` (including P uniformly from 20 to 50) and plots
 scatter plots of Vendi (cell + pseudobulk) and PDS-L1 vs P, reporting
-Pearson r and p-value with OLS trend lines.
+Pearson r and p-value with OLS trend lines. It also compares cell and
+pseudobulk Vendi using Spearman rank correlation.
 
 Example:
     python -m perturbations.analyses.vendi_score.vendi_effective_rank \
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Literal
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -24,7 +26,7 @@ import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 
 from perturbations.analyses.common import NORM_LAYER_KEY
 from perturbations.analyses.plot_utils import apply_paper_plot_style
@@ -106,13 +108,30 @@ def _scatter_encodings(
     return p_effect, marker_areas, color_norm, size_handles
 
 
-def _add_plot_guides(ax: Axes, size_handles: list[Line2D]) -> None:
-    """Stack marker-size and trend guides in the upper-left plot region."""
+def _add_plot_guides(
+    ax: Axes,
+    size_handles: list[Line2D],
+    *,
+    position: Literal["upper-left", "lower-left", "below-identity"] = "upper-left",
+) -> None:
+    """Stack marker-size and trend guides in a clear plot region."""
     line_handles, line_labels = ax.get_legend_handles_labels()
+    if position == "upper-left":
+        size_location = "upper left"
+        line_location = "upper left"
+        line_anchor = (0.0, 0.68)
+    elif position == "lower-left":
+        size_location = "lower left"
+        line_location = "lower left"
+        line_anchor = (0.0, 0.38)
+    else:
+        size_location = "lower right"
+        line_location = "lower right"
+        line_anchor = (1.0, 0.38)
     size_legend = ax.legend(
         handles=size_handles,
         title="Effect factor",
-        loc="upper left",
+        loc=size_location,
     )
     ax.add_artist(size_legend)
     if line_handles:
@@ -123,8 +142,8 @@ def _add_plot_guides(ax: Axes, size_handles: list[Line2D]) -> None:
         ax.legend(
             [handle for handle, _ in line_entries],
             [label for _, label in line_entries],
-            loc="upper left",
-            bbox_to_anchor=(0.0, 0.68),
+            loc=line_location,
+            bbox_to_anchor=line_anchor,
         )
     ax.set_axisbelow(True)
     ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
@@ -237,7 +256,7 @@ def run_effective_rank_sweep(
 
 
 def plot_effective_rank(results: pd.DataFrame, output_dir: Path) -> None:
-    """Save separate Vendi and PDS scatter plots with trend lines."""
+    """Save Vendi/PDS scaling plots and a cell-pseudobulk comparison."""
     apply_paper_plot_style()
     P = results["P"].to_numpy(dtype=float)
     p_effect, marker_areas, color_norm, size_handles = _scatter_encodings(results)
@@ -315,7 +334,7 @@ def plot_effective_rank(results: pd.DataFrame, output_dir: Path) -> None:
         ax.set_title(rf"Pearson $r = {r:.3f}$, $p = {p:.2e}$", fontsize=14)
     ax.set_xlabel("Number of perturbations (P)")
     ax.set_ylabel("PDS-L1")
-    _add_plot_guides(ax, size_handles)
+    _add_plot_guides(ax, size_handles, position="lower-left")
     colorbar = fig.colorbar(scatter, ax=ax, pad=0.02)
     colorbar.set_label(r"$p_{\mathrm{effect}}$ (log scale)")
     fig.suptitle("DirectDGP: PDS-L1 vs P")
@@ -323,6 +342,42 @@ def plot_effective_rank(results: pd.DataFrame, output_dir: Path) -> None:
     fig.savefig(pds_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved PDS plot to {pds_path}")
+
+    # --- Figure C: Cell vs pseudobulk Vendi ---
+    fig, ax = plt.subplots(figsize=(6.0, 5.8), constrained_layout=True)
+    vendi_cell = results["vendi_score_cell"].to_numpy(dtype=float)
+    vendi_pseudobulk = results["vendi_score_pseudobulk"].to_numpy(dtype=float)
+    finite = (
+        np.isfinite(vendi_cell)
+        & np.isfinite(vendi_pseudobulk)
+        & np.isfinite(p_effect)
+        & (p_effect > 0)
+    )
+    scatter = ax.scatter(
+        vendi_cell[finite],
+        vendi_pseudobulk[finite],
+        c=p_effect[finite],
+        s=marker_areas[finite],
+        cmap="viridis",
+        norm=color_norm,
+        alpha=0.65,
+    )
+    lo = min(vendi_cell[finite].min(), vendi_pseudobulk[finite].min())
+    hi = max(vendi_cell[finite].max(), vendi_pseudobulk[finite].max())
+    ax.plot([lo, hi], [lo, hi], "--", color="grey", linewidth=1.5, label="y = x")
+    if finite.sum() >= 3:
+        rho, p = spearmanr(vendi_cell[finite], vendi_pseudobulk[finite])
+        ax.set_title(rf"Spearman $\rho = {rho:.3f}$, $p = {p:.2e}$", fontsize=14)
+    ax.set_xlabel("Vendi (cell)")
+    ax.set_ylabel("Vendi (pseudobulk)")
+    _add_plot_guides(ax, size_handles, position="below-identity")
+    colorbar = fig.colorbar(scatter, ax=ax, pad=0.02)
+    colorbar.set_label(r"$p_{\mathrm{effect}}$ (log scale)")
+    fig.suptitle("DirectDGP: Cell vs pseudobulk Vendi")
+    comparison_path = output_dir / "effective_rank_cell_vs_pseudobulk.png"
+    fig.savefig(comparison_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved cell-vs-pseudobulk plot to {comparison_path}")
 
 
 def _build_parser() -> argparse.ArgumentParser:

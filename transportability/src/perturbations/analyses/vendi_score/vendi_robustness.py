@@ -21,23 +21,36 @@ import argparse
 from pathlib import Path
 
 import anndata as ad
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import sparse
 
 from perturbations.analyses.common import NORM_LAYER_KEY
+from perturbations.analyses.plot_utils import apply_paper_plot_style
 from perturbations.analyses.util import ensure_normalized_log1p_layer, load_real_dataset
-from perturbations.metrics.reconstruction.distance_util import estimate_mmd_gamma
+from perturbations.analyses.vendi_score.run_vendi import (
+    _estimate_vendi_params,
+    _split_half_pds,
+)
 from perturbations.metrics.reconstruction.vendi_score import (
-    estimate_vendi_outer_sigma_squared,
     estimate_vendi_pseudobulk_sigma_squared,
     fit_vendi_pseudobulk_pca,
     vendi_score,
     vendi_score_pseudobulk,
 )
-from perturbations.util.anndata_util import fit_control_incremental_pca
+
+matplotlib.use("Agg")
 
 _DEFAULT_OUTPUT_DIR = "results/vendi_robustness"
+_DEFAULT_N_PCA_COMPONENTS = 50
+_DEFAULT_DROPOUT_LEVELS = (0.0, 0.1, 0.25, 0.5)
+_DEFAULT_GAUSSIAN_LEVELS = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 20.0)
+_PLOT_METRICS = (
+    ("vendi_cell_mean", "vendi_cell_std", "Vendi (cell)", "#3c5488"),
+    ("vendi_pseudobulk_mean", "vendi_pseudobulk_std", "Vendi (pseudobulk)", "#e67700"),
+)
 
 
 def _parse_float_list(text: str) -> list[float]:
@@ -111,7 +124,7 @@ def _compute_vendi_pseudobulk(
     )
 
 
-def _compute_vendi_both(
+def _compute_scores(
     adata: ad.AnnData,
     lognorm_layer: str,
     control_label: str,
@@ -122,8 +135,8 @@ def _compute_vendi_both(
     outer_sigma_squared: float,
     pseudobulk_pca_model: object | None,
     pseudobulk_sigma_squared: float | None,
-) -> tuple[float, float]:
-    """Compute both cell-level and pseudobulk Vendi scores, returning NaN on failure."""
+) -> tuple[float, float, float]:
+    """Compute cell/pseudobulk Vendi and PDS-L1, returning NaN on failure."""
     try:
         cell = _compute_vendi(
             adata,
@@ -147,7 +160,11 @@ def _compute_vendi_both(
         )
     except (ValueError, KeyError):
         pseudobulk = float("nan")
-    return cell, pseudobulk
+    try:
+        pds_l1 = _split_half_pds(adata, lognorm_layer, control_label, seed)["pds_l1"]
+    except (ValueError, KeyError):
+        pds_l1 = float("nan")
+    return cell, pseudobulk, pds_l1
 
 
 def _subsample_cells(adata: ad.AnnData, fraction: float, rng: np.random.Generator) -> ad.AnnData:
@@ -276,7 +293,7 @@ def run_sensitivity(
     noise_type: str = "dropout",
     noise_levels: list[float] | None = None,
     n_seeds: int = 5,
-    n_pca_components: int = 30,
+    n_pca_components: int = _DEFAULT_N_PCA_COMPONENTS,
     vendi_max_cells: int = 20000,
     seed: int = 0,
     counts_layer: str = "counts",
@@ -311,35 +328,19 @@ def run_sensitivity(
     Returns:
         Long DataFrame with columns
         ``["dataset", "sweep", "value", "noise_type", "noise_variance_fraction",
-        "seed", "vendi_cell", "vendi_pseudobulk"]``. For gaussian noise,
+        "seed", "vendi_cell", "vendi_pseudobulk", "pds_l1"]``. For gaussian noise,
         ``value`` is the noise-to-signal ratio (alpha, per-gene) and
         ``noise_variance_fraction = alpha^2 / (1 + alpha^2)``.
     """
     size_fractions = size_fractions or [0.1, 0.25, 0.5, 0.75, 1.0]
-    noise_levels = noise_levels or [0.0, 0.1, 0.25, 0.5]
+    if noise_levels is None:
+        default_levels = (
+            _DEFAULT_GAUSSIAN_LEVELS if noise_type == "gaussian" else _DEFAULT_DROPOUT_LEVELS
+        )
+        noise_levels = list(default_levels)
     rows: list[dict[str, object]] = []
-    pca_model = fit_control_incremental_pca(
-        data_obj=adata,
-        layer_key=lognorm_layer,
-        control_label=control_label,
-        n_pca_components=n_pca_components,
-        obs_key="perturbation",
-        data_name="adata",
-    )
-    gamma = estimate_mmd_gamma(
-        obs=adata,
-        layer_obs=lognorm_layer,
-        control_label=control_label,
-        seed=seed,
-        pca_model=pca_model,
-    )
-    outer_sigma_squared = estimate_vendi_outer_sigma_squared(
-        ac=adata,
-        gamma=gamma,
-        pca_model=pca_model,
-        layer_key=lognorm_layer,
-        control_label=control_label,
-        random_state=seed,
+    pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
+        adata, lognorm_layer, control_label, n_pca_components, seed
     )
     observed_pseudobulk, observed_control_idx = _pseudobulk_matrix(
         adata,
@@ -369,7 +370,7 @@ def run_sensitivity(
         for s in range(n_seeds):
             rng = np.random.default_rng(seed + s)
             sub = _subsample_cells(adata, fraction, rng)
-            vendi_cell, vendi_pseudobulk = _compute_vendi_both(
+            vendi_cell, vendi_pseudobulk, pds_l1 = _compute_scores(
                 sub,
                 lognorm_layer,
                 control_label,
@@ -390,10 +391,11 @@ def run_sensitivity(
                     "seed": s,
                     "vendi_cell": vendi_cell,
                     "vendi_pseudobulk": vendi_pseudobulk,
+                    "pds_l1": pds_l1,
                 }
             )
 
-    # Noise sweep: fixed (capped) size, inject noise, recompute Vendi.
+    # Noise sweep: fixed capped size; inject noise and recompute Vendi.
     base = _subsample_cells(
         adata,
         min(1.0, vendi_max_cells / max(1, adata.n_obs)),
@@ -432,7 +434,7 @@ def run_sensitivity(
                 gaussian_gene_std=gaussian_gene_std,
                 clip_gaussian_nonnegative=clip_gaussian_nonnegative,
             )
-            vendi_cell, vendi_pseudobulk = _compute_vendi_both(
+            vendi_cell, vendi_pseudobulk, pds_l1 = _compute_scores(
                 noised,
                 lognorm_layer,
                 control_label,
@@ -454,6 +456,7 @@ def run_sensitivity(
                     "seed": s,
                     "vendi_cell": vendi_cell,
                     "vendi_pseudobulk": vendi_pseudobulk,
+                    "pds_l1": pds_l1,
                 }
             )
 
@@ -467,6 +470,8 @@ def summarize_sensitivity(results: pd.DataFrame) -> pd.DataFrame:
         vendi_cell_std=("vendi_cell", "std"),
         vendi_pseudobulk_mean=("vendi_pseudobulk", "mean"),
         vendi_pseudobulk_std=("vendi_pseudobulk", "std"),
+        pds_l1_mean=("pds_l1", "mean"),
+        pds_l1_std=("pds_l1", "std"),
         noise_variance_fraction=("noise_variance_fraction", "first"),
         n_seeds=("seed", "count"),
     )
@@ -474,7 +479,107 @@ def summarize_sensitivity(results: pd.DataFrame) -> pd.DataFrame:
     grouped["vendi_pseudobulk_cv"] = (
         grouped["vendi_pseudobulk_std"] / grouped["vendi_pseudobulk_mean"].abs()
     )
+    grouped["pds_l1_cv"] = grouped["pds_l1_std"] / grouped["pds_l1_mean"].abs()
     return grouped
+
+
+def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
+    """Save dataset-size and noise robustness plots from a sensitivity summary."""
+    apply_paper_plot_style()
+
+    sweep_specs = (
+        ("size", "Cells retained", "Dataset size"),
+        ("noise", "Noise level", "Injected noise"),
+    )
+    for sweep, default_x_label, sweep_title in sweep_specs:
+        sweep_data = summary.loc[summary["sweep"] == sweep].sort_values("value")
+        if sweep_data.empty:
+            continue
+
+        x_column = "value"
+        x_label = default_x_label
+        if sweep == "noise":
+            noise_types = sweep_data["noise_type"].dropna().astype(str).unique()
+            if len(noise_types) == 1:
+                if noise_types[0] == "gaussian":
+                    x_column = "noise_variance_fraction"
+                    x_label = r"Noise variance fraction ($\alpha^2 / (1 + \alpha^2)$)"
+                elif noise_types[0] == "dropout":
+                    x_label = "Dropout probability"
+
+        x = sweep_data[x_column].to_numpy(dtype=float)
+        fig, axes = plt.subplots(1, 2, figsize=(11.0, 5.8), constrained_layout=True)
+        for ax, (mean_column, std_column, metric_label, color) in zip(
+            axes, _PLOT_METRICS, strict=True
+        ):
+            mean = sweep_data[mean_column].to_numpy(dtype=float)
+            std = np.nan_to_num(sweep_data[std_column].to_numpy(dtype=float), nan=0.0)
+            finite = np.isfinite(x) & np.isfinite(mean) & np.isfinite(std)
+            if not finite.any():
+                continue
+
+            ax.plot(
+                x[finite],
+                mean[finite],
+                "-o",
+                color=color,
+                markersize=8,
+                label="Mean",
+            )
+            ax.fill_between(
+                x[finite],
+                mean[finite] - std[finite],
+                mean[finite] + std[finite],
+                color=color,
+                alpha=0.2,
+                label=r"$\pm$ 1 SD",
+            )
+            ax.set_title(metric_label, fontsize=14)
+            ax.set_xlabel(x_label)
+            ax.set_ylabel("Vendi score")
+            ax.set_axisbelow(True)
+            ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+            ax.legend()
+
+        fig.suptitle(f"{name}: Vendi robustness to {sweep_title.lower()}")
+        output_path = output_dir / f"{name}_vendi_robustness_{sweep}.png"
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved {sweep_title.lower()} plot to {output_path}")
+
+        pds_mean = sweep_data["pds_l1_mean"].to_numpy(dtype=float)
+        pds_std = np.nan_to_num(sweep_data["pds_l1_std"].to_numpy(dtype=float), nan=0.0)
+        finite = np.isfinite(x) & np.isfinite(pds_mean) & np.isfinite(pds_std)
+        if not finite.any():
+            continue
+
+        fig, ax = plt.subplots(figsize=(6.0, 5.8), constrained_layout=True)
+        ax.plot(
+            x[finite],
+            pds_mean[finite],
+            "-o",
+            color="#c92a2a",
+            markersize=8,
+            label="Mean",
+        )
+        ax.fill_between(
+            x[finite],
+            pds_mean[finite] - pds_std[finite],
+            pds_mean[finite] + pds_std[finite],
+            color="#c92a2a",
+            alpha=0.2,
+            label=r"$\pm$ 1 SD",
+        )
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("PDS-L1")
+        ax.set_axisbelow(True)
+        ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+        ax.legend()
+        fig.suptitle(f"{name}: PDS-L1 robustness to {sweep_title.lower()}")
+        pds_path = output_dir / f"{name}_pds_l1_robustness_{sweep}.png"
+        fig.savefig(pds_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved PDS-L1 {sweep_title.lower()} plot to {pds_path}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -499,10 +604,19 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["all", "perturbed"],
         help="Inject noise into all cells or only non-control (perturbed) cells.",
     )
-    parser.add_argument("--noise-levels", default="0.0,0.1,0.25,0.5")
+    parser.add_argument(
+        "--noise-levels",
+        default=None,
+        help="Comma-separated noise levels; defaults depend on --noise-type.",
+    )
     parser.add_argument("--n-seeds", type=int, default=5)
-    parser.add_argument("--n-pca-components", type=int, default=30)
-    parser.add_argument("--vendi-max-cells", type=int, default=20000)
+    parser.add_argument("--n-pca-components", type=int, default=_DEFAULT_N_PCA_COMPONENTS)
+    parser.add_argument(
+        "--vendi-max-cells",
+        type=int,
+        default=20000,
+        help="Cap noise-sweep cells for tractability.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", default=_DEFAULT_OUTPUT_DIR)
     return parser
@@ -530,7 +644,9 @@ def main() -> None:
         control_label=args.control_label,
         size_fractions=_parse_float_list(args.size_fractions),
         noise_type=args.noise_type,
-        noise_levels=_parse_float_list(args.noise_levels),
+        noise_levels=(
+            _parse_float_list(args.noise_levels) if args.noise_levels is not None else None
+        ),
         n_seeds=args.n_seeds,
         n_pca_components=args.n_pca_components,
         vendi_max_cells=args.vendi_max_cells,
@@ -547,6 +663,7 @@ def main() -> None:
     summary.to_csv(summary_path, index=False)
     print(f"\nWrote raw results to {results_path}")
     print(f"Wrote summary to {summary_path}")
+    plot_robustness(summary, output_dir, name)
     print(summary.to_string(index=False))
 
 
