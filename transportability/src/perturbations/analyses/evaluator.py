@@ -16,7 +16,7 @@ from ..metrics.perturbation_effect.perturbation_discrimination_score import pds
 from ..metrics.perturbation_effect.r_square import r2_score_pert
 from ..metrics.reconstruction.distribution_distance import distribution_distance
 from ..metrics.reconstruction.mean_error import mean_error_pert
-from ..metrics.reconstruction.vendi_score import vendi_score, vendi_score_pseudobulk
+from ..metrics.reconstruction.vendi_score import vendi_score_pseudobulk
 from ..util.anndata_util import get_matrix, obs_has_key
 
 
@@ -242,15 +242,6 @@ def evaluation(
         )
 
         pred_has_control = bool(np.any(np.asarray(pred.obs["perturbation"]) == control_label))
-        vendi_score_pred = vendi_score(
-            ac=pred,
-            n_pca_components=50,
-            layer_key=layer_name,
-            control_label=control_label if pred_has_control else None,
-            gamma=mmd_gamma,
-            pca_model=mmd_pca_model,
-            outer_sigma_squared=vendi_outer_sigma_squared,
-        )
 
         if pred_has_control:
             pred_for_de = pred
@@ -288,37 +279,29 @@ def evaluation(
         parametric_distance = np.nan
         mmd_distance = np.nan
         fid_distance = np.nan
-        if int(mu_pred.shape[0]) == n_perts + 1:
-            control_idx = 0
-        elif int(mu_pred.shape[0]) == n_perts:
-            control_idx = None
-        else:
-            raise ValueError(
-                f"mu_pred has unexpected number of rows ({mu_pred.shape[0]}). "
-                f"Expected {n_perts} (no control row) or {n_perts + 1} (with control row)."
-            )
-        vendi_score_pred = vendi_score_pseudobulk(
-            mu_pred,
-            control_idx=control_idx,
-            pca_model=vendi_pseudobulk_pca_model,
-            outer_sigma_squared=vendi_pseudobulk_sigma_squared,
+
+    # Pseudobulk Vendi is comparable across every model type (cell-level or
+    # pseudobulk-only), so compute it unconditionally from mu_pred/mu_obs.
+    if int(mu_pred.shape[0]) == n_perts + 1:
+        pred_control_idx = 0
+    elif int(mu_pred.shape[0]) == n_perts:
+        pred_control_idx = None
+    else:
+        raise ValueError(
+            f"mu_pred has unexpected number of rows ({mu_pred.shape[0]}). "
+            f"Expected {n_perts} (no control row) or {n_perts + 1} (with control row)."
         )
+    vendi_score_pred = vendi_score_pseudobulk(
+        mu_pred,
+        control_idx=pred_control_idx,
+        pca_model=vendi_pseudobulk_pca_model,
+        outer_sigma_squared=vendi_pseudobulk_sigma_squared,
+    )
+    if vendi_score_obs is None:
         vendi_score_obs = vendi_score_pseudobulk(
             mu_obs,
             pca_model=vendi_pseudobulk_pca_model,
             outer_sigma_squared=vendi_pseudobulk_sigma_squared,
-        )
-
-    # Get vendi score for the observed data as well
-    if vendi_score_obs is None:
-        vendi_score_obs = vendi_score(
-            ac=obs,
-            n_pca_components=50,
-            layer_key=layer_name,
-            control_label=control_label if obs_has_control else None,
-            gamma=mmd_gamma,
-            pca_model=mmd_pca_model,
-            outer_sigma_squared=vendi_outer_sigma_squared,
         )
 
     pds_l1_score = pds(
