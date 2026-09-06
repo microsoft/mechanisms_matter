@@ -465,3 +465,13 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# symlinks to directories and files
+/transportability/src/perturbations/data/**/*.h5ad
+/transportability/src/perturbations/data/**/*.pkl
+/transportability/src/perturbations/data/**/*.csv.gz
+/transportability/src/perturbations/data/**/processed_manifest.json
+/transportability/src/perturbations/data/cd4+/processed*
+/transportability/src/perturbations/data/replogle22/RPE1
+/transportability/src/perturbations/data/replogle22/Jurkat
+/transportability/src/perturbations/data/replogle22/HepG2

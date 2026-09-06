@@ -36,8 +36,8 @@ Usage
     cd transportability/geneformer_env
     GIT_LFS_SKIP_SMUDGE=1 uv sync
     uv run python extract_geneformer_embeddings.py \\
-        --input data/norman19/norman19_processed.h5ad \\
-        --output data/norman19/norman19_geneformer.h5ad \\
+        --input ../src/perturbations/data/norman19/norman19_processed.h5ad \\
+        --output ../src/perturbations/data/norman19/norman19_geneformer.h5ad \\
         --counts-layer counts \\
         --model-dir "$GENEFORMER_MODEL_DIR" \\
         --obsm-key X_geneformer

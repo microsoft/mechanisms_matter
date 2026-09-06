@@ -26,8 +26,8 @@ git-LFS pointer stubs, not real pickles.
 
 ```bash
 uv run python extract_geneformer_embeddings.py \
-  --input ../data/norman19/norman19_processed.h5ad \
-  --output ../data/norman19/norman19_geneformer.h5ad \
+  --input ../src/perturbations/data/norman19/norman19_processed.h5ad \
+  --output ../src/perturbations/data/norman19/norman19_geneformer.h5ad \
   --counts-layer counts \
   --model-dir ./gf_assets/Geneformer-V2-104M \
   --obsm-key X_geneformer
@@ -52,7 +52,7 @@ Back in the main transportability environment, run real experiments with the enr
 cd transportability
 uv run python -m perturbations.analyses.real_experiments.run \
   --dataset_name norman19 \
-  --dataset_path data/norman19/norman19_geneformer.h5ad \
+  --dataset_path src/perturbations/data/norman19/norman19_geneformer.h5ad \
   --split_strategy in-context \
   --n_trials 5 \
   --basal_embedding_key X_geneformer
