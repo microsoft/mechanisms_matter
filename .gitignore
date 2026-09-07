@@ -475,3 +475,12 @@ FodyWeavers.xsd
 /transportability/src/perturbations/data/replogle22/RPE1
 /transportability/src/perturbations/data/replogle22/Jurkat
 /transportability/src/perturbations/data/replogle22/HepG2
+
+# geneformer assets
+/transportability/geneformer_env/gf_assets/*
+
+# slurm jobs
+**/slurms/*
+
+# results
+**/results/*

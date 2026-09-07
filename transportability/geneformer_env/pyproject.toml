@@ -44,19 +44,17 @@ dependencies = [
 
 [tool.uv.sources]
 geneformer = { git = "https://huggingface.co/ctheodoris/Geneformer" }
-# CPU torch keeps the env small (no CUDA/triton). For GPU compute, switch the
-# index URL below to a CUDA build (e.g. .../whl/cu121) that matches the node.
-torch = [{ index = "torch-cpu" }]
+torch = [
+    { index = "torch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "torch-cu130", marker = "sys_platform == 'linux'" },
+]
 
 [[tool.uv.index]]
 name = "torch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-# For a CUDA build of torch on GPU compute, point torch at a cuXXX index instead:
-# torch = [{ index = "torch-cuda" }]
-# [[tool.uv.index]]
-# name = "torch-cuda"
-# url = "https://download.pytorch.org/whl/cu121"
-# explicit = true
-
+[[tool.uv.index]]
+name = "torch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

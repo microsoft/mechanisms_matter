@@ -43,7 +43,7 @@ def _vendi_from_spectrum(eigenvalues: np.ndarray) -> float:
 
 def _prepare_control_null_calibration(
     ac: AnnData | AnnCollection,
-    layer_key: str,
+    layer_key: str | None,
     control_label: str,
     n_splits: int,
     null_quantile: float,
@@ -154,7 +154,7 @@ def fit_vendi_pseudobulk_pca(
 def estimate_vendi_pseudobulk_sigma_squared(
     ac: AnnData | AnnCollection,
     pca_model: Any,
-    layer_key: str,
+    layer_key: str | None,
     control_label: str = "control",
     n_splits: int = 200,
     null_quantile: float = 0.95,
@@ -288,7 +288,7 @@ def estimate_vendi_outer_sigma_squared(
     ac: AnnData | AnnCollection,
     gamma: float,
     pca_model: Any,
-    layer_key: str,
+    layer_key: str | None,
     control_label: str = "control",
     n_splits: int = 200,
     null_quantile: float = 0.95,
