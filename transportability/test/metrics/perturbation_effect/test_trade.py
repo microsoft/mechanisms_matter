@@ -4,8 +4,6 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
-from pydeseq2.dds import DeseqDataSet
-from pydeseq2.ds import DeseqStats
 
 import perturbations.metrics.perturbation_effect.trade as trade
 from perturbations.metrics.perturbation_effect.trade import (
@@ -190,6 +188,8 @@ def test_deseq2_effect_sizes_matches_per_contrast_deseqstats(batch_key: str | No
     per contrast, which recomputes both every time.
     """
     pytest.importorskip("pydeseq2")
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
 
     pseudobulk = _synthetic_pseudobulk()
     optimized = trade.deseq2_effect_sizes(pseudobulk, batch_key=batch_key, quiet=True, n_cpus=1)
@@ -243,6 +243,119 @@ def test_deseq2_effect_sizes_matches_per_contrast_deseqstats(batch_key: str | No
                 err_msg=f"{column} diverged for contrast {lab!r}",
                 equal_nan=True,
             )
+
+
+def _pseudobulk_with_cooks_all_zero_gene(
+    n_conditions: int = 3,
+    n_replicates: int = 8,
+    n_genes: int = 40,
+    seed: int = 0,
+) -> ad.AnnData:
+    """
+    Build a pseudobulk dataset in which Cooks refitting zeroes out one gene.
+
+    Two things are needed to reach that branch. Each condition must have at
+    least ``DeseqDataSet.min_replicates`` (7) samples, or no sample is
+    replaceable and refitting is skipped entirely. And one gene must collapse
+    to all-zero once its outlier is imputed: PyDESeq2 replaces outlier counts
+    with ``int(trimmed_mean(counts / size_factors) * size_factors)``, so a gene
+    that is zero everywhere except a single huge count gets a 20%-trimmed mean
+    of zero, and every one of its counts becomes zero.
+    """
+    rng = np.random.default_rng(seed)
+    labels: list[str] = []
+    for condition in range(n_conditions):
+        name = "control" if condition == 0 else f"gene_{condition}"
+        labels.extend([name] * n_replicates)
+
+    counts = rng.negative_binomial(20, 0.3, size=(len(labels), n_genes)).astype(np.int64)
+    for condition in range(1, n_conditions):
+        mask = np.asarray(labels) == f"gene_{condition}"
+        counts[mask, condition] += 60
+
+    # The trigger gene: a lone, enormous outlier over an otherwise empty row.
+    counts[:, -1] = 0
+    counts[0, -1] = 500_000
+
+    gene_names = [f"g{i}" for i in range(n_genes - 1)] + ["g_cooks_all_zero"]
+    return ad.AnnData(
+        X=counts,
+        obs=pd.DataFrame(
+            {"perturbation": labels},
+            index=[f"s{i}" for i in range(len(labels))],
+        ),
+        var=pd.DataFrame(index=gene_names),
+    )
+
+
+def test_deseq2_effect_sizes_matches_deseqstats_when_cooks_refit_zeroes_a_gene() -> None:
+    """
+    Genes zeroed by Cooks refitting must match PyDESeq2, not carry a stale SE.
+
+    ``DeseqStats.run_wald_test`` ends by forcing ``SE``/``statistics``/
+    ``p_values`` to ``0/0/1`` on ``new_all_zeroes_genes``. Because
+    ``deseq2_effect_sizes`` injects precomputed Wald results, ``summary()``
+    short-circuits ``run_wald_test`` and would otherwise skip that correction:
+    refitting sets the gene's LFC row to zero, which keeps ``mu`` finite, so the
+    hoisted path computes an ordinary Wald SE where PyDESeq2 reports exactly 0.
+
+    The regular equivalence test cannot catch this -- it uses 3 replicates per
+    condition, below ``min_replicates``, so nothing is ever replaceable.
+    """
+    pytest.importorskip("pydeseq2")
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+
+    pseudobulk = _pseudobulk_with_cooks_all_zero_gene()
+    optimized = trade.deseq2_effect_sizes(pseudobulk, batch_key=None, quiet=True, n_cpus=1)
+
+    labels = np.asarray(pseudobulk.obs["perturbation"]).astype(str)
+    unique_labels = list(dict.fromkeys(labels.tolist()))
+    safe = {lab: f"c{i}" for i, lab in enumerate(unique_labels)}
+    dds = DeseqDataSet(
+        counts=pd.DataFrame(
+            np.asarray(pseudobulk.X, dtype=np.int64),
+            index=np.asarray(pseudobulk.obs_names, dtype=str),
+            columns=np.asarray(pseudobulk.var_names, dtype=str),
+        ),
+        metadata=pd.DataFrame(
+            {"condition": [safe[lab] for lab in labels]},
+            index=np.asarray(pseudobulk.obs_names, dtype=str),
+        ),
+        design="~condition",
+        ref_level=["condition", safe["control"]],
+        quiet=True,
+        n_cpus=1,
+    )
+    dds.deseq2()
+
+    # Guard: without this the test silently passes even if the branch is never
+    # reached, which is exactly how the original divergence went unnoticed.
+    assert dds.refit_cooks
+    assert int(dds.var["replaced"].sum()) > 0
+    assert "g_cooks_all_zero" in set(dds.new_all_zeroes_genes)
+
+    for lab in optimized:
+        stats = DeseqStats(
+            dds,
+            contrast=["condition", safe[lab], safe["control"]],
+            quiet=True,
+            n_cpus=1,
+        )
+        stats.summary()
+        expected = stats.results_df
+        actual = optimized[lab]
+        for column in ["log2FoldChange", "lfcSE", "pvalue", "padj"]:
+            np.testing.assert_allclose(
+                actual[column].to_numpy(dtype=float),
+                expected[column].to_numpy(dtype=float),
+                rtol=1e-10,
+                atol=1e-12,
+                err_msg=f"{column} diverged for contrast {lab!r}",
+                equal_nan=True,
+            )
+        # Pin the specific value the correction restores.
+        assert actual.loc["g_cooks_all_zero", "lfcSE"] == 0.0
 
 
 def test_wald_tests_all_contrasts_rejects_mismatched_contrast_length() -> None:
