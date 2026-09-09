@@ -293,7 +293,11 @@ def _wald_tests_all_contrasts(
         n_cpus: Number of worker processes. ``None`` uses all available cores.
 
     Returns:
-        Tuple ``(se, stat, pvalue)``, each of shape ``(n_genes, n_contrasts)``.
+        Tuple ``(se, stat, pvalue)``, each of shape ``(n_genes, n_contrasts)``,
+        matching what ``DeseqStats.run_wald_test`` would produce for each
+        contrast -- including its zeroing of genes that Cooks refitting turned
+        all-zero. The Cooks *p-value* filter is left to the caller, mirroring
+        PyDESeq2, where it is applied by ``summary()`` after the Wald test.
     """
     design_matrix = np.asarray(dds.obsm["design_matrix"].values, dtype=np.float64)
     lfc = np.asarray(dds.varm["LFC"].values, dtype=np.float64)
@@ -345,6 +349,21 @@ def _wald_tests_all_contrasts(
     with np.errstate(invalid="ignore"):
         pvalue = 2.0 * norm.sf(np.abs(stat))
     pvalue[~np.isfinite(stat)] = np.nan
+
+    # ``DeseqStats.run_wald_test`` finishes by zeroing out genes that Cooks
+    # outlier refitting turned all-zero. Callers inject these arrays into
+    # ``DeseqStats``, which makes ``summary()`` skip ``run_wald_test`` -- and
+    # with it that correction -- so it has to be reapplied here. Without it
+    # such a gene keeps a spurious non-zero standard error: refitting sets its
+    # LFC row to zero, which leaves ``mu`` finite, so the loop above computes
+    # an ordinary Wald SE where PyDESeq2 would report exactly 0.
+    if dds.refit_cooks and int(dds.var["replaced"].sum()) > 0:
+        all_zeroes = np.asarray(dds.var_names.isin(dds.new_all_zeroes_genes), dtype=bool)
+        if all_zeroes.any():
+            se[all_zeroes] = 0.0
+            stat[all_zeroes] = 0.0
+            pvalue[all_zeroes] = 1.0
+
     return se, stat, pvalue
 
 
