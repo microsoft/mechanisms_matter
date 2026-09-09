@@ -41,6 +41,27 @@ def _vendi_from_spectrum(eigenvalues: np.ndarray) -> float:
     return float(np.exp(entropy))
 
 
+def covariance_effective_rank(samples: np.ndarray) -> float:
+    """
+    Compute entropy effective rank from the centered covariance spectrum.
+
+    Rows are samples and columns are features. Centering removes a shared
+    baseline, while squared singular values provide the covariance eigenvalue
+    spectrum up to a scale that cancels during entropy normalization.
+    """
+    matrix = np.asarray(samples, dtype=np.float64)
+    if matrix.ndim != 2:
+        raise ValueError(f"samples must be a 2D array. Got shape={matrix.shape}.")
+    if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        return float("nan")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("samples contains non-finite values (NaN or inf).")
+
+    centered = matrix - matrix.mean(axis=0, keepdims=True)
+    singular_values = np.linalg.svd(centered, compute_uv=False)
+    return _vendi_from_spectrum(singular_values**2)
+
+
 def _prepare_control_null_calibration(
     ac: AnnData | AnnCollection,
     layer_key: str | None,

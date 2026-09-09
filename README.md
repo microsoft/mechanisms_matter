@@ -80,7 +80,13 @@ STATE (Geneformer) uses [Geneformer](https://huggingface.co/ctheodoris/Geneforme
 
 The `perturbations` package provides evaluation metrics for perturbation models across three categories: perturbation effect, reconstruction, and gene selection. The [proposed Vendi score](transportability/src/perturbations/metrics/reconstruction/vendi_score.py) is used in two forms: a cell-level Vendi score for distributional reconstruction and a pseudobulk Vendi score for perturbation effects.
 
-The [Vendi robustness analysis](transportability/src/perturbations/analyses/vendi_score/vendi_robustness.py) evaluates robustness under cell subsampling and injected dropout or Gaussian noise. The [effective-rank validation](transportability/src/perturbations/analyses/vendi_score/vendi_effective_rank.py) confirms that the Vendi score tracks perturbation diversity across randomly simulated datasets. The [`run_vendi`](transportability/src/perturbations/analyses/vendi_score/run_vendi.py) script computes dataset-level Vendi scores and split-half PDS-L1 for real and synthetic datasets.
+Three analyses validate the Vendi score:
+
+- [Effective-rank benchmark](transportability/src/perturbations/analyses/vendi_score/vendi_effective_rank.py): benchmarks cell-level and pseudobulk Vendi against the direct pseudobulk covariance effective rank across simulated datasets.
+- [Null-signal validation](transportability/src/perturbations/analyses/vendi_score/vendi_null_signal.py): tests metric behavior from the population null through increasing perturbation-effect strength and under pseudobulk sampling noise.
+- [Robustness analysis](transportability/src/perturbations/analyses/vendi_score/vendi_robustness.py): evaluates Vendi and effective-rank sensitivity to injected Gaussian noise.
+
+The [`run_vendi`](transportability/src/perturbations/analyses/vendi_score/run_vendi.py) script computes dataset-level Vendi scores and split-half PDS-L1 for real and synthetic datasets.
 
 ## Prerequisites
 
