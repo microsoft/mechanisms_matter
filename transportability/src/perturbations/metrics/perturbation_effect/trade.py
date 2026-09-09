@@ -8,17 +8,18 @@ expression effect sizes and its transcriptome-wide impact, following TRADE
 Pipeline:
 
 1. ``pseudobulk_replicates`` aggregates single cells into pseudobulk samples with
-   pseudo-replicates (random cell partitions) per perturbation (and optional
-   context), producing the replicate structure DESeq2 requires.
-2. ``deseq2_effect_sizes`` runs PyDESeq2 for each perturbation versus control and
-   returns per-gene log2 fold changes and their standard errors.
-3. ``transcriptome_wide_impact`` deconvolves the true effect-size variance from
-   the estimation noise encoded in those standard errors.
+    either real batches or random cell partitions per perturbation (and optional
+    context), producing the replicate structure DESeq2 requires.
+2. ``deseq2_effect_sizes`` fits one PyDESeq2 model across all conditions in a
+    context, then computes each perturbation-versus-control Wald contrast and
+    returns per-gene log2 fold changes and their standard errors.
+3. ``transcriptome_wide_impact`` fits a zero-centered normal-mixture prior to
+    deconvolve estimation noise, then reports the true effect-size variance and
+    the effective number of differentially expressed genes (``pi_deg``).
 
-Because raw single cells rarely carry biological replicates, pseudo-replicates
-are used. Apply the *same* pseudo-replicate scheme to real and simulated data so
-the comparison isolates the data rather than the differential-expression
-pipeline.
+When biological batches are available, they define pseudobulk replicates and
+are included as a blocking factor in the DESeq2 design. Otherwise, cells are
+randomly split into pseudo-replicates.
 """
 
 # pyright: reportUnknownMemberType=false
