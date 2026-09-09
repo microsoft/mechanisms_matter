@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 import anndata as ad
 import numpy as np
@@ -13,6 +15,7 @@ from scipy import sparse
 from perturbations.analyses.vendi_score.run_vendi import (
     _OUTPUT_COLUMNS,
     DatasetSpec,
+    _assert_non_discrete_expression,
     _base_result_row,
     _split_half_pds,
 )
@@ -214,6 +217,12 @@ def test_output_columns_include_pds_and_scope() -> None:
     assert "vendi_score_pseudobulk" in _OUTPUT_COLUMNS
 
 
+def test_rejects_discrete_expression_for_pds_and_vendi() -> None:
+    adata = ad.AnnData(X=np.arange(12, dtype=np.float32).reshape(3, 4))
+    with pytest.raises(AssertionError, match="discrete count-like values"):
+        _assert_non_discrete_expression(adata, layer_key=None)
+
+
 # --- Synthetic CausalDGP layer selection ---
 
 
@@ -377,3 +386,124 @@ class TestRealDataLayerSelection:
         )
         assert "normalized_log1p" in adata.layers
         assert rows[0]["layer_key"] == "normalized_log1p"
+
+
+def _write_cd4_chunk(
+    path: Path,
+    *,
+    donor: str,
+    timepoint: str,
+    gene_names: list[str],
+    perturbations: list[str],
+    n_control: int,
+    n_per_perturbation: int,
+    seed: int,
+) -> int:
+    """
+    Write one CD4-style chunk whose X is normalized and whose counts live in a layer.
+
+    The extra ``counts`` layer is the point of the fixture: an AnnCollection view exposes
+    X under the ``None`` layer key, so a chunk carrying any real layer previously broke
+    ``to_adata()``.
+    """
+    rng = np.random.default_rng(seed)
+    labels = ["control"] * n_control
+    for pert in perturbations:
+        labels.extend([pert] * n_per_perturbation)
+
+    n_cells = len(labels)
+    n_genes = len(gene_names)
+    counts = rng.poisson(lam=3.0, size=(n_cells, n_genes)).astype(np.float32)
+    # Give each perturbation a distinct mean so the clouds are separable.
+    for i in range(len(perturbations)):
+        start = n_control + i * n_per_perturbation
+        counts[start : start + n_per_perturbation] += float(2 * (i + 1))
+
+    totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
+    normalized = np.log1p(counts / totals * 1e4).astype(np.float32)
+
+    obs = pd.DataFrame(
+        {
+            "perturbation": labels,
+            "condition": ["stim" if timepoint != "Rest" else "rest"] * n_cells,
+            "donor": [donor] * n_cells,
+            "timepoint": [timepoint] * n_cells,
+            "context": [f"{donor}_{timepoint}"] * n_cells,
+        },
+        index=[f"{donor}_{timepoint}_cell{i}" for i in range(n_cells)],
+    )
+    var = pd.DataFrame(index=pd.Index(gene_names))
+    adata = ad.AnnData(X=normalized, obs=obs, var=var)
+    adata.layers["counts"] = counts
+    adata.write_h5ad(path)
+    return n_cells
+
+
+class TestCd4ChunkedScoring:
+    """Regression coverage for the backed AnnCollection CD4 scoring path."""
+
+    @staticmethod
+    def _build_manifest(tmp_path: Path) -> str:
+        gene_names = [f"GENE{i}" for i in range(8)]
+        perturbations = ["GENE0", "GENE1", "GENE2"]
+        chunk_dir = tmp_path / "chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks = []
+        for seed, (donor, timepoint) in enumerate([("D1", "Rest"), ("D1", "Stim8hr")]):
+            chunk_path = chunk_dir / f"cd4_{donor}_{timepoint}.h5ad"
+            n_obs = _write_cd4_chunk(
+                chunk_path,
+                donor=donor,
+                timepoint=timepoint,
+                gene_names=gene_names,
+                perturbations=perturbations,
+                n_control=64,
+                n_per_perturbation=10,
+                seed=seed,
+            )
+            chunks.append(
+                {
+                    "path": f"chunks/{chunk_path.name}",
+                    "context": f"{donor}_{timepoint}",
+                    "donor": donor,
+                    "timepoint": timepoint,
+                    "chunk_index_within_context": 0,
+                    "n_obs": n_obs,
+                    "n_vars": len(gene_names),
+                }
+            )
+
+        manifest_path = tmp_path / "processed_manifest.json"
+        manifest_path.write_text(json.dumps({"n_chunks": len(chunks), "chunks": chunks}))
+        return str(manifest_path)
+
+    def test_scores_each_donor_timepoint_context(self, tmp_path: Path) -> None:
+        from perturbations.analyses.vendi_score import run_vendi as rv
+
+        spec = DatasetSpec(
+            dataset="CD4+",
+            dataset_variant=None,
+            dataset_label="CD4+",
+            dataset_path=self._build_manifest(tmp_path),
+            is_cd4_chunked=True,
+        )
+        rows = rv._compute_cd4_vendi_score(
+            spec=spec,
+            batch_size=32,
+            n_pca_components=3,
+            sample_size=32,
+            random_state=0,
+            by_context=True,
+        )
+
+        assert [row["scope"] for row in rows] == ["D1_Rest", "D1_Stim8hr"]
+        for row in rows:
+            assert row["context_axis"] == "donor_timepoint"
+            assert row["layer_key"] == "normalized_log1p"
+            assert row["n_total_perturbations"] == 3
+            # The pseudobulk and PDS scores are the ones that require materializing the
+            # backed slice, so a finite value here is what pins the to_adata() fix.
+            assert np.isfinite(row["vendi_score_cell"])
+            assert np.isfinite(row["vendi_score_pseudobulk"])
+            assert np.isfinite(row["pds_l1"])
