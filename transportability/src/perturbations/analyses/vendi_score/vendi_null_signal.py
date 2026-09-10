@@ -237,7 +237,7 @@ def plot_null_signal_sweep(summary: pd.DataFrame, output_dir: Path) -> None:
                 color=color,
                 linestyle=linestyle,
                 linewidth=2.0,
-                label=rf"{label}, $N_k={int(Nk)}$",
+                label=rf"{label}, $N_P={int(Nk)}$",
                 zorder=line_zorder,
             )
             ax.fill_between(
