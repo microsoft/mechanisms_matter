@@ -791,7 +791,7 @@ def run_one_trial(
             perturbation_column="perturbation",
             control_label="control",
             expression_layer=obs_layer,
-            use_gene_ontology_graph=False,
+            use_gene_ontology_graph=True,
             normalized_target_sum=norm_target_sum,
         )
         gears_pred = gears_out["preds"].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1256,7 +1256,7 @@ def run_one_trial_cd4_chunked(
                     perturbation_column="perturbation",
                     control_label="control",
                     expression_layer=None,
-                    use_gene_ontology_graph=False,
+                    use_gene_ontology_graph=True,
                     normalized_target_sum=norm_target_sum,
                 ),
             )

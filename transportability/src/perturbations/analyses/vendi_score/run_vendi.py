@@ -119,6 +119,19 @@ def _require_existing_path(path: str) -> None:
         raise FileNotFoundError(f"Dataset input does not exist: {path}")
 
 
+def _assert_non_discrete_expression(data_obj: Any, layer_key: str | None) -> None:
+    """Assert that the expression selected for PDS and Vendi is not raw counts."""
+    n_obs = int(data_obj.n_obs)
+    if n_obs == 0:
+        return
+
+    row_indices = np.linspace(0, n_obs - 1, num=min(n_obs, 32), dtype=np.int64)
+    values = extract_rows(data_obj, row_indices, layer_key)
+    assert not np.allclose(values, np.rint(values), rtol=0.0, atol=1e-6), (
+        "PDS and Vendi require log-normalized expression; received discrete count-like values."
+    )
+
+
 def _estimate_vendi_params(
     ac: ad.AnnData,
     layer_key: str | None,
@@ -411,6 +424,7 @@ def _compute_h5ad_vendi_score(
 
         rows: list[dict[str, Any]] = []
         for scope_label, adata_slice in slices:
+            _assert_non_discrete_expression(adata_slice, vendi_layer_key)
             pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
                 adata_slice, vendi_layer_key, _CONTROL_LABEL, n_pca_components, random_state
             )
@@ -491,6 +505,7 @@ def _compute_cd4_vendi_score(
             else:
                 ac_slice = handle.collection
 
+            _assert_non_discrete_expression(ac_slice, vendi_layer_key)
             pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
                 ac_slice, vendi_layer_key, _CONTROL_LABEL, n_pca_components, random_state
             )
@@ -507,9 +522,14 @@ def _compute_cd4_vendi_score(
                 pca_model=pca_model,
                 outer_sigma_squared=outer_sigma_squared,
             )
-            # CD4 backed slices: materialize for PDS pseudobulk computation
+            # CD4 backed slices: materialize for PDS pseudobulk computation.
+            # An AnnCollection view exposes X under the ``None`` layer key, so a plain
+            # ``to_adata()`` forwards both X and ``layers[None]`` to the AnnData
+            # constructor and raises "If you provide `layers[None]` and `X`, they must be
+            # identical". CD4 scoring always reads X (``_cd4_vendi_layer`` maps the
+            # normalized layer to ``None``), so the source layers are not needed here.
             if hasattr(ac_slice, "to_adata"):
-                pds_adata = ac_slice.to_adata()
+                pds_adata = ac_slice.to_adata(ignore_layers=True)
             else:
                 pds_adata = ac_slice
             pds_scores = _split_half_pds(pds_adata, vendi_layer_key, _CONTROL_LABEL, random_state)
@@ -676,6 +696,7 @@ def _compute_synthetic_vendi_score(
 
     rows: list[dict[str, Any]] = []
     for scope_label, adata_slice in slices:
+        _assert_non_discrete_expression(adata_slice, layer_key)
         pca_model, gamma, outer_sigma_squared = _estimate_vendi_params(
             adata_slice, layer_key, _CONTROL_LABEL, n_pca_components, random_state
         )

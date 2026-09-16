@@ -8,17 +8,18 @@ expression effect sizes and its transcriptome-wide impact, following TRADE
 Pipeline:
 
 1. ``pseudobulk_replicates`` aggregates single cells into pseudobulk samples with
-   pseudo-replicates (random cell partitions) per perturbation (and optional
-   context), producing the replicate structure DESeq2 requires.
-2. ``deseq2_effect_sizes`` runs PyDESeq2 for each perturbation versus control and
-   returns per-gene log2 fold changes and their standard errors.
-3. ``transcriptome_wide_impact`` deconvolves the true effect-size variance from
-   the estimation noise encoded in those standard errors.
+    either real batches or random cell partitions per perturbation (and optional
+    context), producing the replicate structure DESeq2 requires.
+2. ``deseq2_effect_sizes`` fits one PyDESeq2 model across all conditions in a
+    context, then computes each perturbation-versus-control Wald contrast and
+    returns per-gene log2 fold changes and their standard errors.
+3. ``transcriptome_wide_impact`` fits a zero-centered normal-mixture prior to
+    deconvolve estimation noise, then reports the true effect-size variance and
+    the effective number of differentially expressed genes (``pi_deg``).
 
-Because raw single cells rarely carry biological replicates, pseudo-replicates
-are used. Apply the *same* pseudo-replicate scheme to real and simulated data so
-the comparison isolates the data rather than the differential-expression
-pipeline.
+When biological batches are available, they define pseudobulk replicates and
+are included as a blocking factor in the DESeq2 design. Otherwise, cells are
+randomly split into pseudo-replicates.
 """
 
 # pyright: reportUnknownMemberType=false
@@ -39,6 +40,7 @@ from anndata import AnnData
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
 from scipy import sparse
+from scipy.stats import norm
 
 from perturbations.util.anndata_util import get_matrix
 
@@ -52,6 +54,35 @@ def _deseq2_n_cpus() -> int | None:
     """
     raw = os.environ.get("DESEQ2_N_CPUS", "").strip()
     return int(raw) if raw else None
+
+
+def _deseq2_size_factors_fit_type() -> str | None:
+    """
+    Read the ``DESEQ2_SIZE_FACTORS_FIT_TYPE`` override for PyDESeq2 normalization.
+
+    Unlike ``DESEQ2_N_CPUS`` this DOES change the numerics, so it is opt-in and
+    unset by default (PyDESeq2 then uses its own default, ``"ratio"``).
+
+    The reason to override is that ``"ratio"`` (median-of-ratios) needs at least
+    one gene that is non-zero in *every* pseudobulk sample. On a sparse
+    perturbation panel -- one sample per (perturbation x batch), a few cells each
+    -- no gene satisfies that, and PyDESeq2 silently falls back to ``"iterative"``,
+    which optimizes one size factor per sample with derivative-free Powell and is
+    computationally intractable at this scale. ``"poscounts"`` is DESeq2's
+    estimator for exactly this case: it uses each sample's positive counts only,
+    is closed-form, and never triggers the fallback.
+
+    Accepted values: ``"ratio"``, ``"poscounts"``, ``"iterative"``.
+    """
+    raw = os.environ.get("DESEQ2_SIZE_FACTORS_FIT_TYPE", "").strip()
+    if not raw:
+        return None
+    allowed = {"ratio", "poscounts", "iterative"}
+    if raw not in allowed:
+        raise ValueError(
+            f"DESEQ2_SIZE_FACTORS_FIT_TYPE must be one of {sorted(allowed)}, got {raw!r}."
+        )
+    return raw
 
 
 def _counts_matrix(adata: AnnData, layer: str | None) -> sparse.csr_matrix | np.ndarray:
@@ -188,6 +219,154 @@ def pseudobulk_replicates(
     return pseudobulk
 
 
+def _wald_chunk(
+    design_matrix: np.ndarray,
+    lfc_chunk: np.ndarray,
+    disp_chunk: np.ndarray,
+    size_factors: np.ndarray,
+    contrast_vectors: np.ndarray,
+    ridge_factor: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute Wald standard errors and statistics for a block of genes.
+
+    Mirrors ``pydeseq2.utils.wald_test`` operation for operation, but builds the
+    covariance matrix ``M`` and its regularized inverse ``H`` once per gene and
+    reuses them across every contrast, instead of rebuilding both for each
+    (gene, contrast) pair.
+
+    Args:
+        design_matrix: Design matrix of shape ``(n_samples, n_params)``.
+        lfc_chunk: Fitted natural-log LFCs, shape ``(n_genes, n_params)``.
+        disp_chunk: Per-gene dispersions, shape ``(n_genes,)``.
+        size_factors: Per-sample size factors, shape ``(n_samples,)``.
+        contrast_vectors: Contrast vectors, shape ``(n_params, n_contrasts)``.
+        ridge_factor: Regularization matrix, shape ``(n_params, n_params)``.
+
+    Returns:
+        Tuple ``(se, stat)``, each of shape ``(n_genes, n_contrasts)``.
+    """
+    n_genes = lfc_chunk.shape[0]
+    n_contrasts = contrast_vectors.shape[1]
+    se = np.full((n_genes, n_contrasts), np.nan, dtype=np.float64)
+    stat = np.full((n_genes, n_contrasts), np.nan, dtype=np.float64)
+
+    # mu = exp(X @ LFC.T) scaled by size factors, as in DeseqStats.run_wald_test.
+    mu_chunk = np.exp(design_matrix @ lfc_chunk.T) * size_factors[:, None]
+
+    for gene in range(n_genes):
+        mu = mu_chunk[:, gene]
+        if not np.all(np.isfinite(mu)):
+            # Genes with unfitted (all-zero) LFCs stay NaN, matching PyDESeq2.
+            continue
+        weights = mu / (1.0 + mu * disp_chunk[gene])
+        cov = (design_matrix.T * weights[None, :]) @ design_matrix
+        hat = np.linalg.inv(cov + ridge_factor)
+        lfc = lfc_chunk[gene]
+        for contrast_idx in range(n_contrasts):
+            contrast = contrast_vectors[:, contrast_idx]
+            hat_contrast = hat @ contrast
+            wald_se = np.sqrt(hat_contrast.T @ cov @ hat_contrast)
+            se[gene, contrast_idx] = wald_se
+            stat[gene, contrast_idx] = contrast @ lfc / wald_se
+
+    return se, stat
+
+
+def _wald_tests_all_contrasts(
+    dds: DeseqDataSet,
+    contrast_vectors: np.ndarray,
+    n_cpus: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Run every Wald contrast against a fitted ``DeseqDataSet`` in one pass.
+
+    PyDESeq2 exposes only a one-contrast-at-a-time API (``DeseqStats``), which
+    rebuilds the per-gene covariance matrix and its inverse for every contrast
+    even though both are contrast-independent once ``dds.deseq2()`` has run.
+    For a Replogle-scale panel that is ~1000 redundant rebuilds per gene and
+    dominates total runtime. This computes them once per gene instead.
+
+    Args:
+        dds: A ``DeseqDataSet`` on which ``deseq2()`` has already been run.
+        contrast_vectors: Contrast vectors, shape ``(n_params, n_contrasts)``.
+        n_cpus: Number of worker processes. ``None`` uses all available cores.
+
+    Returns:
+        Tuple ``(se, stat, pvalue)``, each of shape ``(n_genes, n_contrasts)``,
+        matching what ``DeseqStats.run_wald_test`` would produce for each
+        contrast -- including its zeroing of genes that Cooks refitting turned
+        all-zero. The Cooks *p-value* filter is left to the caller, mirroring
+        PyDESeq2, where it is applied by ``summary()`` after the Wald test.
+    """
+    design_matrix = np.asarray(dds.obsm["design_matrix"].values, dtype=np.float64)
+    lfc = np.asarray(dds.varm["LFC"].values, dtype=np.float64)
+    dispersions = np.asarray(dds.var["dispersions"].values, dtype=np.float64)
+    size_factors = np.asarray(dds.obs["size_factors"].values, dtype=np.float64)
+
+    n_params = design_matrix.shape[1]
+    if contrast_vectors.shape[0] != n_params:
+        raise ValueError(
+            f"Contrast vectors have {contrast_vectors.shape[0]} rows but the design "
+            f"matrix has {n_params} columns."
+        )
+    # PyDESeq2 uses this fixed ridge when no LFC prior variance is supplied.
+    ridge_factor = np.diag(np.repeat(1e-6, n_params))
+
+    n_genes = lfc.shape[0]
+    workers = max(1, min(n_cpus or multiprocessing.cpu_count(), n_genes))
+    bounds = np.array_split(np.arange(n_genes), workers)
+
+    if workers == 1:
+        se, stat = _wald_chunk(
+            design_matrix, lfc, dispersions, size_factors, contrast_vectors, ridge_factor
+        )
+    else:
+        se = np.empty((n_genes, contrast_vectors.shape[1]), dtype=np.float64)
+        stat = np.empty_like(se)
+        with ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _wald_chunk,
+                    design_matrix,
+                    lfc[idx],
+                    dispersions[idx],
+                    size_factors,
+                    contrast_vectors,
+                    ridge_factor,
+                ): idx
+                for idx in bounds
+                if idx.size
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                chunk_se, chunk_stat = future.result()
+                se[idx] = chunk_se
+                stat[idx] = chunk_stat
+
+    with np.errstate(invalid="ignore"):
+        pvalue = 2.0 * norm.sf(np.abs(stat))
+    pvalue[~np.isfinite(stat)] = np.nan
+
+    # ``DeseqStats.run_wald_test`` finishes by zeroing out genes that Cooks
+    # outlier refitting turned all-zero. Callers inject these arrays into
+    # ``DeseqStats``, which makes ``summary()`` skip ``run_wald_test`` -- and
+    # with it that correction -- so it has to be reapplied here. Without it
+    # such a gene keeps a spurious non-zero standard error: refitting sets its
+    # LFC row to zero, which leaves ``mu`` finite, so the loop above computes
+    # an ordinary Wald SE where PyDESeq2 would report exactly 0.
+    if dds.refit_cooks and int(dds.var["replaced"].sum()) > 0:
+        all_zeroes = np.asarray(dds.var_names.isin(dds.new_all_zeroes_genes), dtype=bool)
+        if all_zeroes.any():
+            se[all_zeroes] = 0.0
+            stat[all_zeroes] = 0.0
+            pvalue[all_zeroes] = 1.0
+
+    return se, stat, pvalue
+
+
 def deseq2_effect_sizes(
     pseudobulk: AnnData,
     perturbation_key: str = "perturbation",
@@ -262,6 +441,16 @@ def deseq2_effect_sizes(
         flush=True,
     )
     fit_start = time.time()
+    size_factors_fit_type = _deseq2_size_factors_fit_type()
+    if size_factors_fit_type is not None:
+        print(
+            f"[{datetime.now():%H:%M:%S}] [deseq2] pid={os.getpid()} "
+            f"size_factors_fit_type={size_factors_fit_type} (overridden)",
+            flush=True,
+        )
+    dds_kwargs: dict[str, Any] = {}
+    if size_factors_fit_type is not None:
+        dds_kwargs["size_factors_fit_type"] = size_factors_fit_type
     dds = DeseqDataSet(
         counts=counts_df,
         metadata=metadata,
@@ -269,6 +458,7 @@ def deseq2_effect_sizes(
         ref_level=["condition", safe[control_label]],
         quiet=quiet,
         n_cpus=n_cpus,
+        **dds_kwargs,
     )
     dds.deseq2()
     print(
@@ -282,7 +472,41 @@ def deseq2_effect_sizes(
     ]
     n_contrasts = len(contrast_targets)
     contrast_start = time.time()
+
+    # The Wald covariance terms (M and its inverse H) depend only on quantities
+    # frozen by ``dds.deseq2()`` -- mu, dispersions, the design matrix and the
+    # fitted LFCs -- so they are identical for every contrast. Computing them
+    # once per gene instead of once per (gene, contrast) is the whole speedup.
+    contrast_vectors = np.column_stack(
+        [
+            np.asarray(
+                dds.contrast(
+                    column="condition",
+                    baseline=safe[control_label],
+                    group_to_compare=safe[lab],
+                ),
+                dtype=np.float64,
+            )
+            for lab in contrast_targets
+        ]
+    )
+    se_matrix, stat_matrix, pval_matrix = _wald_tests_all_contrasts(
+        dds, contrast_vectors, n_cpus=n_cpus
+    )
+    print(
+        f"[{datetime.now():%H:%M:%S}] [deseq2] pid={os.getpid()} "
+        f"Wald tests for {n_contrasts} contrasts in "
+        f"{(time.time() - contrast_start) / 60:.1f} min",
+        flush=True,
+    )
+
+    # Cooks outlier flags are also contrast-independent, so evaluate them once
+    # and disable DeseqStats' per-contrast recomputation.
+    cooks_outliers = np.asarray(dds.cooks_outlier(), dtype=bool)
+
+    post_start = time.time()
     results: dict[str, pd.DataFrame] = {}
+    var_names = pd.Index(np.asarray(dds.var_names, dtype=str))
     for done, lab in enumerate(contrast_targets, start=1):
         stats = DeseqStats(
             dds,
@@ -290,11 +514,19 @@ def deseq2_effect_sizes(
             quiet=quiet,
             n_cpus=n_cpus,
         )
+        # Inject the precomputed Wald results so ``summary`` skips the redundant
+        # per-contrast refit and only runs the cheap p-value post-processing.
+        pvalues = pval_matrix[:, done - 1].copy()
+        pvalues[cooks_outliers] = np.nan
+        stats.SE = pd.Series(se_matrix[:, done - 1], index=var_names)
+        stats.statistics = pd.Series(stat_matrix[:, done - 1], index=var_names)
+        stats.p_values = pd.Series(pvalues, index=var_names)
+        stats.cooks_filter = False
         stats.summary()
         df = stats.results_df
         results[lab] = df.loc[:, ["log2FoldChange", "lfcSE", "pvalue", "padj"]].copy()
         if done % 50 == 0 or done == n_contrasts:
-            rate = (time.time() - contrast_start) / done
+            rate = (time.time() - post_start) / done
             eta = (n_contrasts - done) * rate / 3600.0
             print(
                 f"[{datetime.now():%H:%M:%S}] [deseq2] pid={os.getpid()} "

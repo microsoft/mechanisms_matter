@@ -1,9 +1,8 @@
 r"""
-Vendi diversity-score sensitivity to injected Gaussian noise.
+Vendi and effective-rank sensitivity to injected Gaussian noise.
 
-Sweeps the perturbation-level Vendi score across injected Gaussian noise
-levels, with repeated seeds, to characterize when the diversity-aware metric
-is stable.
+Sweeps perturbation-level diversity scores across injected Gaussian noise
+levels, with repeated seeds, to characterize their stability.
 
 Example:
     python -m perturbations.analyses.vendi_score.vendi_robustness \\
@@ -35,6 +34,7 @@ from perturbations.analyses.vendi_score.run_vendi import (
     _split_half_pds,
 )
 from perturbations.metrics.reconstruction.vendi_score import (
+    covariance_effective_rank,
     estimate_vendi_pseudobulk_sigma_squared,
     fit_vendi_pseudobulk_pca,
     vendi_score,
@@ -47,8 +47,20 @@ _DEFAULT_OUTPUT_DIR = "results/vendi_robustness"
 _DEFAULT_N_PCA_COMPONENTS = 50
 _DEFAULT_GAUSSIAN_LEVELS = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 20.0)
 _PLOT_METRICS = (
-    ("vendi_cell_mean", "vendi_cell_std", "Vendi (cell)", "#3c5488"),
-    ("vendi_pseudobulk_mean", "vendi_pseudobulk_std", "Vendi (pseudobulk)", "#e67700"),
+    (
+        "vendi_pseudobulk_mean",
+        "vendi_pseudobulk_std",
+        "Vendi (pseudobulk)",
+        "#e67700",
+        4,
+    ),
+    (
+        "effective_rank_pseudobulk_mean",
+        "effective_rank_pseudobulk_std",
+        "Effective rank (pseudobulk)",
+        "#2b8a3e",
+        3,
+    ),
 )
 
 
@@ -121,6 +133,17 @@ def _compute_vendi_pseudobulk(
             outer_sigma_squared=outer_sigma_squared,
         )
     )
+
+
+def _compute_effective_rank_pseudobulk(
+    pseudobulk: np.ndarray,
+    control_idx: int | None,
+) -> float:
+    """Compute covariance effective rank after excluding an optional control row."""
+    perturbation_rows = (
+        np.delete(pseudobulk, control_idx, axis=0) if control_idx is not None else pseudobulk
+    )
+    return covariance_effective_rank(perturbation_rows)
 
 
 def _compute_scores(
@@ -279,8 +302,9 @@ def run_sensitivity(
     Returns:
         Long DataFrame with columns
         ``["dataset", "sweep", "value", "noise_type", "noise_variance_fraction",
-        "seed", "vendi_cell", "vendi_pseudobulk", "pds_l1"]``. ``value`` is the
-        noise-to-signal ratio (alpha, per-gene) and
+        "seed", "vendi_cell", "vendi_pseudobulk",
+        "effective_rank_pseudobulk", "pds_l1"]``. ``value`` is the noise-to-signal
+        ratio (alpha, per-gene) and
         ``noise_variance_fraction = alpha^2 / (1 + alpha^2)``.
     """
     noise_levels = noise_levels if noise_levels is not None else list(_DEFAULT_GAUSSIAN_LEVELS)
@@ -360,6 +384,10 @@ def run_sensitivity(
                     random_state=seed + s,
                 )
 
+            effective_rank_pseudobulk = _compute_effective_rank_pseudobulk(
+                observed_pseudobulk,
+                observed_control_idx,
+            )
             vendi_cell, vendi_pseudobulk, pds_l1 = _compute_scores(
                 noised,
                 lognorm_layer,
@@ -382,6 +410,7 @@ def run_sensitivity(
                     "seed": s,
                     "vendi_cell": vendi_cell,
                     "vendi_pseudobulk": vendi_pseudobulk,
+                    "effective_rank_pseudobulk": effective_rank_pseudobulk,
                     "pds_l1": pds_l1,
                 }
             )
@@ -396,6 +425,8 @@ def summarize_sensitivity(results: pd.DataFrame) -> pd.DataFrame:
         vendi_cell_std=("vendi_cell", "std"),
         vendi_pseudobulk_mean=("vendi_pseudobulk", "mean"),
         vendi_pseudobulk_std=("vendi_pseudobulk", "std"),
+        effective_rank_pseudobulk_mean=("effective_rank_pseudobulk", "mean"),
+        effective_rank_pseudobulk_std=("effective_rank_pseudobulk", "std"),
         pds_l1_mean=("pds_l1", "mean"),
         pds_l1_std=("pds_l1", "std"),
         noise_variance_fraction=("noise_variance_fraction", "first"),
@@ -405,12 +436,20 @@ def summarize_sensitivity(results: pd.DataFrame) -> pd.DataFrame:
     grouped["vendi_pseudobulk_cv"] = (
         grouped["vendi_pseudobulk_std"] / grouped["vendi_pseudobulk_mean"].abs()
     )
+    grouped["effective_rank_pseudobulk_cv"] = (
+        grouped["effective_rank_pseudobulk_std"] / grouped["effective_rank_pseudobulk_mean"].abs()
+    )
     grouped["pds_l1_cv"] = grouped["pds_l1_std"] / grouped["pds_l1_mean"].abs()
     return grouped
 
 
-def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
-    """Save dataset-size and noise robustness plots from a sensitivity summary."""
+def plot_robustness(
+    summary: pd.DataFrame,
+    output_dir: Path,
+    name: str,
+    n_perturbations: int | None = None,
+) -> None:
+    """Save noise robustness plots from a sensitivity summary."""
     apply_paper_plot_style()
 
     sweep_specs = (("noise", "Noise level", "Injected noise"),)
@@ -426,10 +465,8 @@ def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
             x_label = r"Noise variance fraction ($\alpha^2 / (1 + \alpha^2)$)"
 
         x = sweep_data[x_column].to_numpy(dtype=float)
-        fig, axes = plt.subplots(1, 2, figsize=(11.0, 5.8), constrained_layout=True)
-        for ax, (mean_column, std_column, metric_label, color) in zip(
-            axes, _PLOT_METRICS, strict=True
-        ):
+        fig, ax = plt.subplots(figsize=(8.0, 5.8), constrained_layout=True)
+        for mean_column, std_column, metric_label, color, line_zorder in _PLOT_METRICS:
             mean = sweep_data[mean_column].to_numpy(dtype=float)
             std = np.nan_to_num(sweep_data[std_column].to_numpy(dtype=float), nan=0.0)
             finite = np.isfinite(x) & np.isfinite(mean) & np.isfinite(std)
@@ -442,7 +479,8 @@ def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
                 "-o",
                 color=color,
                 markersize=8,
-                label="Mean",
+                label=metric_label,
+                zorder=line_zorder,
             )
             ax.fill_between(
                 x[finite],
@@ -450,16 +488,22 @@ def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
                 mean[finite] + std[finite],
                 color=color,
                 alpha=0.2,
-                label=r"$\pm$ 1 SD",
+                zorder=line_zorder - 2,
             )
-            ax.set_title(metric_label, fontsize=14)
-            ax.set_xlabel(x_label)
-            ax.set_ylabel("Vendi score")
-            ax.set_axisbelow(True)
-            ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
-            ax.legend()
 
-        fig.suptitle(f"{name}: Vendi robustness to {sweep_title.lower()}")
+        if n_perturbations is not None:
+            ax.axhline(
+                n_perturbations,
+                color="grey",
+                linestyle=":",
+                linewidth=1.5,
+                label=rf"$P = {n_perturbations}$",
+            )
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Effective diversity")
+        ax.set_axisbelow(True)
+        ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+        ax.legend(loc="upper right", bbox_to_anchor=(1.0, 0.94), fontsize=13)
         output_path = output_dir / f"{name}_vendi_robustness_{sweep}.png"
         fig.savefig(output_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -471,7 +515,7 @@ def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
         if not finite.any():
             continue
 
-        fig, ax = plt.subplots(figsize=(6.0, 5.8), constrained_layout=True)
+        fig, ax = plt.subplots(figsize=(8.0, 5.8), constrained_layout=True)
         ax.plot(
             x[finite],
             pds_mean[finite],
@@ -492,8 +536,7 @@ def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
         ax.set_ylabel("PDS-L1")
         ax.set_axisbelow(True)
         ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
-        ax.legend()
-        fig.suptitle(f"{name}: PDS-L1 robustness to {sweep_title.lower()}")
+        ax.legend(fontsize=13)
         pds_path = output_dir / f"{name}_pds_l1_robustness_{sweep}.png"
         fig.savefig(pds_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -502,7 +545,7 @@ def plot_robustness(summary: pd.DataFrame, output_dir: Path, name: str) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Vendi score sensitivity to Gaussian noise.")
+    parser = argparse.ArgumentParser(description="Diversity-score sensitivity to Gaussian noise.")
     parser.add_argument("--name", default=None)
     parser.add_argument("--dataset-path", required=True, help="Path to the real dataset .h5ad.")
     parser.add_argument("--control-label", default="control")
@@ -569,7 +612,14 @@ def main() -> None:
     summary.to_csv(summary_path, index=False)
     print(f"\nWrote raw results to {results_path}")
     print(f"Wrote summary to {summary_path}")
-    plot_robustness(summary, output_dir, name)
+    perturbation_labels = np.asarray(adata.obs["perturbation"])
+    n_perturbations = int(np.count_nonzero(np.unique(perturbation_labels) != args.control_label))
+    plot_robustness(
+        summary,
+        output_dir,
+        name,
+        n_perturbations=n_perturbations,
+    )
     print(summary.to_string(index=False))
 
 

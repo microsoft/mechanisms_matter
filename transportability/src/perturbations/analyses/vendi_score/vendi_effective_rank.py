@@ -3,9 +3,10 @@ Validate Vendi score effective-rank tracking with DirectDGP.
 
 Generates 100 randomly simulated datasets using DirectDGP-specific parameters
 sampled from ``PARAM_RANGES`` (including P uniformly from 20 to 50) and plots
-scatter plots of Vendi (cell + pseudobulk) and PDS-L1 vs P, reporting
-Pearson r and p-value with OLS trend lines. It also compares cell and
-pseudobulk Vendi using Spearman rank correlation.
+scatter plots of Vendi (cell + pseudobulk), direct pseudobulk covariance
+effective rank, and PDS-L1 vs P, reporting Pearson r and p-value with OLS trend
+lines. It also compares cell and pseudobulk Vendi using Spearman rank
+correlation.
 
 Example:
     python -m perturbations.analyses.vendi_score.vendi_effective_rank \
@@ -30,13 +31,17 @@ from scipy.stats import pearsonr, spearmanr
 
 from perturbations.analyses.common import NORM_LAYER_KEY
 from perturbations.analyses.plot_utils import apply_paper_plot_style
+from perturbations.analyses.util import compute_means_by_perturbation
 from perturbations.analyses.vendi_score.run_vendi import (
     _estimate_vendi_params,
     _pseudobulk_vendi,
     _split_half_pds,
 )
 from perturbations.data.dgp.directDGP import directDGP
-from perturbations.metrics.reconstruction.vendi_score import vendi_score
+from perturbations.metrics.reconstruction.vendi_score import (
+    covariance_effective_rank,
+    vendi_score,
+)
 
 from ..synthetic_simulations.sampling import (
     PARAM_RANGES,
@@ -118,8 +123,8 @@ def _add_plot_guides(
     line_handles, line_labels = ax.get_legend_handles_labels()
     if position == "upper-left":
         size_location = "upper left"
-        line_location = "upper left"
-        line_anchor = (0.0, 0.68)
+        line_location = "lower left"
+        line_anchor = (0.0, 0.0)
     elif position == "lower-left":
         size_location = "lower left"
         line_location = "lower left"
@@ -198,6 +203,14 @@ def _generate_and_score(
         )
     )
     vs_pseudobulk = _pseudobulk_vendi(adata, layer_key, _CONTROL_LABEL, n_pca_components, seed)
+    perturbation_labels = np.asarray(adata.obs["perturbation"])
+    perturbation_ids = np.unique(perturbation_labels[perturbation_labels != _CONTROL_LABEL])
+    pseudobulk = compute_means_by_perturbation(
+        adata_view=adata,
+        perturbation_ids=perturbation_ids,
+        layer_key=layer_key,
+    )
+    effective_rank_pseudobulk = covariance_effective_rank(pseudobulk)
     pds_scores = _split_half_pds(adata, layer_key, _CONTROL_LABEL, seed)
 
     return {
@@ -205,6 +218,7 @@ def _generate_and_score(
         "seed": seed,
         "vendi_score_cell": vs_cell,
         "vendi_score_pseudobulk": vs_pseudobulk,
+        "effective_rank_pseudobulk": effective_rank_pseudobulk,
         "pds_l1": pds_scores["pds_l1"],
         "n_cells": adata.n_obs,
         "n_genes": adata.n_vars,
@@ -261,11 +275,21 @@ def plot_effective_rank(results: pd.DataFrame, output_dir: Path) -> None:
     P = results["P"].to_numpy(dtype=float)
     p_effect, marker_areas, color_norm, size_handles = _scatter_encodings(results)
 
-    # --- Figure A: Vendi cell + pseudobulk vs P ---
-    fig, axes = plt.subplots(1, 2, figsize=(11.0, 5.8), constrained_layout=True)
-    for ax, col, label in [
-        (axes[0], "vendi_score_cell", "Vendi (cell)"),
-        (axes[1], "vendi_score_pseudobulk", "Vendi (pseudobulk)"),
+    # --- Figure A: Vendi and direct effective rank vs P ---
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(11.0, 5.8),
+        sharey=True,
+        constrained_layout=True,
+    )
+    for ax, col, reference_offset in [
+        (axes[0], "vendi_score_pseudobulk", 0.0),
+        (
+            axes[1],
+            "effective_rank_pseudobulk",
+            1.0,
+        ),
     ]:
         y = results[col].to_numpy(dtype=float)
         finite = np.isfinite(P) & np.isfinite(y) & np.isfinite(p_effect) & (p_effect > 0)
@@ -278,11 +302,17 @@ def plot_effective_rank(results: pd.DataFrame, output_dir: Path) -> None:
             norm=color_norm,
             alpha=0.65,
         )
-        lo = min(P[finite].min(), y[finite].min())
-        hi = max(P[finite].max(), y[finite].max())
-        ax.plot([lo, hi], [lo, hi], "--", color="grey", linewidth=1.5, label="y = x")
+        p_limits = np.asarray([P[finite].min(), P[finite].max()])
+        ax.plot(
+            p_limits,
+            p_limits - reference_offset,
+            "--",
+            color="grey",
+            linewidth=1.5,
+            label="y = P" if reference_offset == 0.0 else "y = P - 1",
+        )
         if finite.sum() >= 3:
-            r, p = pearsonr(P[finite], y[finite])
+            r = pearsonr(P[finite], y[finite]).statistic
             slope, intercept = np.polyfit(P[finite], y[finite], 1)
             x_fit = np.linspace(P[finite].min(), P[finite].max(), 50)
             ax.plot(
@@ -293,14 +323,14 @@ def plot_effective_rank(results: pd.DataFrame, output_dir: Path) -> None:
                 linewidth=2.5,
                 label=rf"OLS ($\beta_1 = {slope:.3f}$)",
             )
-            ax.set_title(rf"Pearson $r = {r:.3f}$, $p = {p:.2e}$", fontsize=14)
-        ax.set_xlabel("Number of perturbations (P)")
-        ax.set_ylabel(label)
+            ax.set_title(rf"Pearson $r = {r:.3f}$", fontsize=16, pad=10)
+        ax.set_xlabel(r"$P$")
         _add_plot_guides(ax, size_handles)
 
+    axes[0].set_ylabel("Vendi")
+    axes[1].set_ylabel("Effective rank")
     colorbar = fig.colorbar(scatter, ax=axes, pad=0.02)
     colorbar.set_label(r"$p_{\mathrm{effect}}$ (log scale)")
-    fig.suptitle("DirectDGP: Vendi score vs P")
     vendi_path = output_dir / "effective_rank_vendi.png"
     fig.savefig(vendi_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
