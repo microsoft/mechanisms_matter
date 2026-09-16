@@ -4,6 +4,7 @@ import argparse
 import multiprocessing
 import os
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -159,6 +160,9 @@ def _run_scldm_prediction(
     trial_seed: int,
 ) -> ad.AnnData:
     """Train scLDM and return normalized predictions aligned to the synthetic test split."""
+    from perturbations.models.scldm_attention import configure_synthetic_attention
+
+    configure_synthetic_attention()
     scldm_out = run_scldm(
         train_adata=adata[train_idx, :],
         val_adata=adata[val_idx, :],
@@ -737,6 +741,9 @@ def _pool_worker_timed(task_info_dict):
                 {
                     **params_dict,
                     **results_per_sim_model,
+                    "dataset": dataset_name,
+                    "split_strategy": split_strategy,
+                    "diversity_type": diversity_type,
                     "trial_id": trial_id,
                     "status": "success",
                 }
@@ -744,6 +751,7 @@ def _pool_worker_timed(task_info_dict):
         return final_results_per_sim
 
     except Exception as e:
+        traceback.print_exc()
         # Define metrics_error_keys locally for safety
         metrics_error_keys_local = {
             "pearson",
@@ -792,6 +800,9 @@ def _pool_worker_timed(task_info_dict):
                     {
                         **params_dict,  # original sampled params
                         **metrics_error,
+                        "dataset": dataset_name,
+                        "split_strategy": split_strategy,
+                        "diversity_type": diversity_type,
                         "trial_id": trial_id,
                         "model": model,
                         "status": "failed",
@@ -816,8 +827,13 @@ def run_random_sweep(
     num_workers=None,
     use_multiprocessing=True,
     split_strategy="in-context",
-):
+    trial_start=0,
+) -> pd.DataFrame:
     """Run random synthetic sweeps and save results plus error logs."""
+    if n_trials < 1:
+        raise ValueError("n_trials must be positive.")
+    if trial_start < 0:
+        raise ValueError("trial_start must be non-negative.")
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     if rng is None:
@@ -827,7 +843,7 @@ def run_random_sweep(
             "gene_names must be provided for synthetic sweeps so perturbations map to genes."
         )
     pid = os.getpid()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{pid}"
     split_strategy_tag = split_strategy.replace("-", "_")
     if dataset_name == "directDGP":
         identifier = f"{dataset_name}_{timestamp}"
@@ -850,7 +866,10 @@ def run_random_sweep(
         )
 
     tasks_for_pool = []
-    for i in range(n_trials):
+    # Advance the same parameter stream so separate shards match an unsharded sweep.
+    for _ in range(trial_start):
+        sample_parameters(PARAM_RANGES, rng)
+    for i in range(trial_start, trial_start + n_trials):
         params = sample_parameters(PARAM_RANGES, rng)
         tasks_for_pool.append(
             {
@@ -865,6 +884,12 @@ def run_random_sweep(
     tasks_for_pool = order_tasks_for_pool(tasks_for_pool)
 
     all_results_data = []
+
+    def checkpoint_results() -> None:
+        # Keep completed trials available even if a later trial is interrupted.
+        temporary_csv = csv_file.with_suffix(".csv.tmp")
+        pd.DataFrame(all_results_data).to_csv(temporary_csv, index=False)
+        temporary_csv.replace(csv_file)
 
     if use_multiprocessing:
         print(
@@ -881,6 +906,7 @@ def run_random_sweep(
             with tqdm(total=n_trials, desc="Running Trials (in-memory AnnData)") as pbar:
                 for result_from_worker in pool.imap_unordered(_pool_worker_timed, tasks_for_pool):
                     all_results_data += result_from_worker
+                    checkpoint_results()
                     pbar.update(1)
     else:
         init_worker(control_mu, all_theta, pert_mu, gene_names)
@@ -889,6 +915,7 @@ def run_random_sweep(
             for task in tasks_for_pool:
                 result_from_worker = _pool_worker_timed(task)
                 all_results_data += result_from_worker
+                checkpoint_results()
                 pbar.update(1)
 
     results_df = pd.DataFrame(all_results_data)
@@ -955,7 +982,6 @@ def run_random_sweep(
                 f.write("-" * 80 + "\n")
 
     if not results_df.empty:
-        results_df.to_csv(csv_file, index=False)
         print(f"\nSweep complete. Results saved to '{csv_file}'")
     else:
         print("\nSweep complete. No results to save.")
@@ -964,11 +990,23 @@ def run_random_sweep(
     print(f"Failed: {failure_count}/{n_trials} trials")
     if failure_count > 0:
         print(f"See error log for details: {error_log_file}")
+    return results_df
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run random sweep simulations.")
     parser.add_argument("--n_trials", type=int, default=4, help="Number of trials to run")
+    parser.add_argument(
+        "--trial_start",
+        type=int,
+        default=0,
+        help="First global trial ID; shards with the same seed match an unsharded sweep",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default=_OUTPUT_DIR,
+        help="Directory for completed-trial CSV checkpoints and error logs",
+    )
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -1016,10 +1054,10 @@ if __name__ == "__main__":
 
     # Call the final version of run_random_sweep
     print("Running the sweep...")
-    run_random_sweep(
+    results_df = run_random_sweep(
         args.dataset,
         args.n_trials,
-        _OUTPUT_DIR,
+        args.output_dir,
         control_mu=control_mu,
         all_theta=all_theta,
         pert_mu=pert_mu,
@@ -1029,4 +1067,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,  # num_worker should be around 0.6 * RAM / MAX_SPACE_PER_WORK
         use_multiprocessing=args.multiprocessing,
         split_strategy=args.split_strategy,
+        trial_start=args.trial_start,
     )
+    if results_df.empty or (results_df["status"] != "success").any():
+        raise SystemExit(1)
