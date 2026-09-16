@@ -356,6 +356,7 @@ def extract_geneformer_embeddings(
     special_token: bool = True,
     nproc: int = 4,
     max_ncells: int | None = None,
+    forward_batch_size: int = 64,
 ) -> ad.AnnData:
     """
     Compute Geneformer cell embeddings and attach them to ``adata.obsm``.
@@ -431,7 +432,7 @@ def extract_geneformer_embeddings(
             emb_mode=emb_mode,
             max_ncells=max_ncells,
             emb_layer=-1,
-            forward_batch_size=64,
+            forward_batch_size=forward_batch_size,
             nproc=nproc,
             emb_label=[_CELL_INDEX_COL],
             token_dictionary_file=tokenizer_dicts["token_dictionary_file"],
@@ -529,6 +530,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--emb-mode", default="cls", choices=["cls", "cell"])
     parser.add_argument("--model-input-size", type=int, default=4096)
     parser.add_argument("--nproc", type=int, default=4)
+    parser.add_argument("--forward-batch-size", type=int, default=64)
     parser.add_argument(
         "--max-ncells",
         type=int,
@@ -560,6 +562,7 @@ def main() -> None:
         model_input_size=args.model_input_size,
         nproc=args.nproc,
         max_ncells=args.max_ncells,
+        forward_batch_size=args.forward_batch_size,
     )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
