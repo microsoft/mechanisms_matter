@@ -23,6 +23,7 @@ from perturbations.metrics.reconstruction.vendi_score import (
     estimate_vendi_pseudobulk_sigma_squared,
     fit_vendi_pseudobulk_pca,
     vendi_score,
+    vendi_score_pseudobulk,
 )
 from perturbations.models.linear import predict_linear_pca_baseline
 from perturbations.models.optional import (
@@ -474,14 +475,12 @@ def simulate_one_run(
                     context_axis=eval_context.axis,
                     context_values=eval_context.values,
                 ),
-                "vendi_score_obs": vendi_score(
-                    ac=bucket_test_eval,
-                    n_pca_components=50,
-                    layer_key=NORM_LAYER_KEY,
-                    control_label="control",
-                    gamma=bucket_mmd_gamma,
-                    pca_model=bucket_mmd_pca_model,
-                    outer_sigma_squared=bucket_vendi_outer_sigma_squared,
+                # The evaluator reuses this value instead of recomputing it.
+                # Cache the same pseudobulk metric and calibration used for predictions.
+                "vendi_score_obs": vendi_score_pseudobulk(
+                    bucket_mu_obs,
+                    pca_model=bucket_vendi_pseudobulk_pca_model,
+                    outer_sigma_squared=bucket_vendi_pseudobulk_sigma_squared,
                 ),
             }
         )
