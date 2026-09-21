@@ -50,6 +50,8 @@ def test_null_signal_sweep_pairs_null_and_signal(
 
     assert len(calls) == 8
     assert len(results) == 8
+    assert all(float(call["p_effect"]) == 0.1 for call in calls)
+    assert all(float(call["B"]) == 0.0 for call in calls)
     null_rows = results.loc[results["effect_factor"] == 1.0]
     signal_rows = results.loc[results["effect_factor"] == 2.0]
     assert null_rows["is_population_null"].all()
@@ -82,7 +84,7 @@ def test_summarize_and_plot_null_signal_sweep(tmp_path: Path) -> None:
                     {
                         "P": 4,
                         "Nk": Nk,
-                        "p_effect": 0.05,
+                        "p_effect": 0.1,
                         "effect_factor": effect_factor,
                         "seed": seed,
                         "is_population_null": effect_factor == 1.0,
