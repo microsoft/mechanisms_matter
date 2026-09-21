@@ -11,13 +11,18 @@ from perturbations.analyses.synthetic_simulations import random_sweep as sweep
 from perturbations.metrics.reconstruction.vendi_score import vendi_score_pseudobulk
 
 
-@pytest.mark.parametrize("dataset_name,split_strategy", [
-    ("directDGP", "in-context"),
-    ("causalDGP", "in-context"),
-    ("causalDGP", "cross-context"),
-])
+@pytest.mark.parametrize(
+    "dataset_name,split_strategy",
+    [
+        ("directDGP", "in-context"),
+        ("causalDGP", "in-context"),
+        ("causalDGP", "cross-context"),
+    ],
+)
 def test_observed_cache_uses_pseudobulk_reference(
-    monkeypatch: pytest.MonkeyPatch, dataset_name: str, split_strategy: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dataset_name: str,
+    split_strategy: str,
 ) -> None:
     """Exercise the real runner's context preparation and cache forwarding."""
     rng = np.random.default_rng(7)
@@ -30,8 +35,10 @@ def test_observed_cache_uses_pseudobulk_reference(
     matrix[labels == "g3", 3] += 6
     data = ad.AnnData(
         X=matrix,
-        obs=pd.DataFrame({"perturbation": labels, "cell_line": contexts},
-                         index=[f"cell{i}" for i in range(len(labels))]),
+        obs=pd.DataFrame(
+            {"perturbation": labels, "cell_line": contexts},
+            index=[f"cell{i}" for i in range(len(labels))],
+        ),
         var=pd.DataFrame(index=[f"g{i}" for i in range(4)]),
     )
     data.layers[sweep.NORM_LAYER_KEY] = np.log1p(matrix)
@@ -69,10 +76,23 @@ def test_observed_cache_uses_pseudobulk_reference(
 
     monkeypatch.setattr(sweep, "evaluation", check_evaluation)
     result = sweep.simulate_one_run(
-        dataset_name=dataset_name, split_strategy=split_strategy, diversity_type="both",
-        G=4, N0=20, Nk=20, P=4, p_effect=0.1, effect_factor=2.0, B=0.5, mu_l=1.0,
-        all_theta=np.ones(4), control_mu=np.ones(4), pert_mu=np.ones(4),
-        gene_names=np.asarray(data.var_names), pid=1, trial_id_for_rng=0,
+        dataset_name=dataset_name,
+        split_strategy=split_strategy,
+        diversity_type="both",
+        G=4,
+        N0=20,
+        Nk=20,
+        P=4,
+        p_effect=0.1,
+        effect_factor=2.0,
+        B=0.5,
+        mu_l=1.0,
+        all_theta=np.ones(4),
+        control_mu=np.ones(4),
+        pert_mu=np.ones(4),
+        gene_names=np.asarray(data.var_names),
+        pid=1,
+        trial_id_for_rng=0,
     )
     assert result and evaluated
     assert {row["model"] for row in result} == {"Control", "Average"}
