@@ -34,14 +34,14 @@ from ..synthetic_simulations.sampling import load_parameter_estimation_inputs
 matplotlib.use("Agg")
 
 _DEFAULT_OUTPUT_DIR = "results/vendi_null_signal"
-_DEFAULT_EFFECT_FACTORS = (1.0, 1.2, 2.0, 5.0)
+_DEFAULT_EFFECT_FACTORS = (1.0, 1.2, 1.5, 1.8, 2.0, 5.0)
 _DEFAULT_NK_VALUES = (64, 256)
 _DEFAULT_REPEATS = 5
 _DEFAULT_P = 20
 _DEFAULT_G = 1024
 _DEFAULT_N0 = 512
-_DEFAULT_P_EFFECT = 0.05
-_DEFAULT_B = 1.0
+_DEFAULT_P_EFFECT = 0.1
+_DEFAULT_B = 0.0
 _DEFAULT_MU_L = 2.5
 _CONTROL_LABEL = "control"
 
