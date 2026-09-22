@@ -56,6 +56,8 @@ EXPECTED_MODEL_ORDER: tuple[str, ...] = (
     "GEARS",
     "CPA",
     "STATE",
+    "STATE-Geneformer",
+    "scLDM",
 )
 MODEL_TICK_LABEL_ROTATION = 45.0
 MODEL_TICK_LABEL_ALIGNMENT = "right"
@@ -69,6 +71,8 @@ MODEL_COLORS: dict[str, str] = {
     "GEARS": "#9c755f",
     "CPA": "#3c5488",
     "STATE": "#b07aa1",
+    "STATE-Geneformer": "#7f7f7f",
+    "scLDM": "#f2c14e",
 }
 COMMON_METRIC_LABELS: dict[str, str] = {
     "pearson": "Pearson",
