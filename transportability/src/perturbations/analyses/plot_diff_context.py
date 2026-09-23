@@ -296,7 +296,7 @@ def main() -> None:
     model_order = resolve_expected_model_order(
         in_context_data,
         cross_context_data,
-        expected_order=(*EXPECTED_MODEL_ORDER, "STATE-Geneformer", "scLDM"),
+        expected_order=EXPECTED_MODEL_ORDER,
     )
     print(f"Models available across inputs: {model_order}")
 

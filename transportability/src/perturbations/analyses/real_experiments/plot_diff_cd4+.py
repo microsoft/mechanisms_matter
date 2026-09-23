@@ -18,7 +18,7 @@ if __package__ in {None, ""}:
 from ..plot_utils import (
     COMMON_METRIC_LABELS,
     EXPECTED_MODEL_ORDER,
-    MODEL_COLORS as COMMON_MODEL_COLORS,
+    MODEL_COLORS,
     apply_paper_plot_style,
     coerce_numeric,
     metric_axis_label,
@@ -29,8 +29,7 @@ from ..plot_utils import (
 
 apply_paper_plot_style()
 
-CD4_MODEL_ORDER: tuple[str, ...] = (*EXPECTED_MODEL_ORDER, "STATE-Geneformer", "scLDM")
-MODEL_COLORS: dict[str, str] = {**COMMON_MODEL_COLORS, "STATE-Geneformer": "#7f7f7f"}
+CD4_MODEL_ORDER: tuple[str, ...] = EXPECTED_MODEL_ORDER
 
 CONTEXT_ORDER: tuple[str, ...] = (
     "D2_Rest",

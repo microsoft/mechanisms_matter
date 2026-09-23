@@ -459,7 +459,7 @@ def main() -> None:
             for change_results in split_change_results.values()
             for data in change_results.values()
         ],
-        expected_order=(*EXPECTED_MODEL_ORDER, "scLDM"),
+        expected_order=EXPECTED_MODEL_ORDER,
     )
     print(f"Models available across inputs: {model_order}")
 

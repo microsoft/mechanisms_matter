@@ -25,8 +25,10 @@ from ..plot_utils import (
 
 apply_paper_plot_style()
 
-REAL_MODEL_ORDER: tuple[str, ...] = (*EXPECTED_MODEL_ORDER, "STATE (geneformer)", "scLDM")
 MODEL_LABEL_ALIASES: dict[str, str] = {"STATE-Geneformer": "STATE (geneformer)"}
+REAL_MODEL_ORDER: tuple[str, ...] = tuple(
+    MODEL_LABEL_ALIASES.get(model, model) for model in EXPECTED_MODEL_ORDER
+)
 
 PAIR_METRIC_GROUPS: tuple[tuple[str, str], ...] = (
     ("pearson", "pearson_degs"),
