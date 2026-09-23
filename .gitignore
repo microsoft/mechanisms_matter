@@ -484,3 +484,7 @@ FodyWeavers.xsd
 
 # results
 **/results/*
+
+# figures
+new_results/*
+old_results/*
