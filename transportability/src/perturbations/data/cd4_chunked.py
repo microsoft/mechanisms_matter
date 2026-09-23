@@ -199,6 +199,33 @@ def _unique_obs_names(index: pd.Index, chunk_key: str) -> pd.Index:
     return pd.Index([f"{name}-{chunk_key}" for name in index.astype(str)], dtype=object)
 
 
+def _validate_embedding(
+    matrix: Any,
+    *,
+    key: str,
+    path: Path,
+    n_obs: int,
+    expected_width: int | None,
+) -> int:
+    """Reject malformed embeddings before a split can hide a bad source chunk."""
+    shape = getattr(matrix, "shape", ())
+    if len(shape) != 2 or shape[0] != n_obs or shape[1] <= 0:
+        raise ValueError(
+            f"{path}: obsm[{key!r}] must have shape ({n_obs}, positive width); got {shape}."
+        )
+    width = int(shape[1])
+    if expected_width is not None and width != expected_width:
+        raise ValueError(f"{path}: obsm[{key!r}] has width {width}; expected {expected_width}.")
+    values = matrix.data if sparse.issparse(matrix) else np.asarray(matrix)
+    if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
+        raise ValueError(f"{path}: obsm[{key!r}] must contain real numeric values.")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{path}: obsm[{key!r}] contains non-finite values.")
+    if values.size and np.abs(values).max() > np.finfo(np.float32).max:
+        raise ValueError(f"{path}: obsm[{key!r}] exceeds the float32 range used by STATE.")
+    return width
+
+
 class CD4ChunkedDataset:
     """Chunk-aware CD4 dataset runtime for metadata-first split planning."""
 
@@ -212,6 +239,7 @@ class CD4ChunkedDataset:
         var: pd.DataFrame,
         available_layers: tuple[str, ...],
         log1p_uns: Any | None,
+        obsm_widths: dict[str, int] | None = None,
     ) -> None:
         """Initialize a chunked CD4 dataset from manifest and metadata."""
         self.manifest_path = manifest_path
@@ -221,14 +249,20 @@ class CD4ChunkedDataset:
         self.var = var
         self.available_layers = available_layers
         self._log1p_uns = log1p_uns
+        self.obsm_widths = dict(obsm_widths or {})
         self._row_ends = np.asarray([record.row_end for record in records], dtype=np.int64)
 
     @classmethod
-    def from_manifest(cls, manifest_path: str | Path) -> CD4ChunkedDataset:
-        """Load CD4 chunk metadata from a processed or subset manifest."""
+    def from_manifest(
+        cls,
+        manifest_path: str | Path,
+        *,
+        required_obsm_keys: tuple[str, ...] = (),
+    ) -> CD4ChunkedDataset:
+        """Load metadata and validate requested embeddings across every source chunk."""
         manifest_path = Path(manifest_path).resolve()
         records = parse_cd4_chunk_records(manifest_path)
-        planning_obs = cls._load_planning_obs(records)
+        planning_obs, obsm_widths = cls._load_planning_obs(records, required_obsm_keys)
         empty_obs_template, var, available_layers, log1p_uns = cls._load_reference_metadata(
             records[0].path
         )
@@ -240,6 +274,7 @@ class CD4ChunkedDataset:
             var=var,
             available_layers=available_layers,
             log1p_uns=log1p_uns,
+            obsm_widths=obsm_widths,
         )
 
     @staticmethod
@@ -260,12 +295,31 @@ class CD4ChunkedDataset:
         return empty_obs_template, var, available_layers, log1p_uns
 
     @staticmethod
-    def _load_planning_obs(records: list[ChunkRecord]) -> pd.DataFrame:
+    def _load_planning_obs(
+        records: list[ChunkRecord],
+        required_obsm_keys: tuple[str, ...] = (),
+    ) -> tuple[pd.DataFrame, dict[str, int]]:
         """Load only the observation metadata needed for split planning."""
         frames: list[pd.DataFrame] = []
+        obsm_widths: dict[str, int] = {}
         for record in records:
             adata = ad.read_h5ad(record.path, backed="r")
             try:
+                if adata.n_obs != record.n_obs:
+                    raise ValueError(
+                        f"{record.path}: manifest n_obs={record.n_obs} does not match "
+                        f"the chunk n_obs={adata.n_obs}."
+                    )
+                for key in dict.fromkeys(required_obsm_keys):
+                    if key not in adata.obsm:
+                        raise KeyError(f"{record.path}: requested obsm[{key!r}] is missing.")
+                    obsm_widths[key] = _validate_embedding(
+                        adata.obsm[key],
+                        key=key,
+                        path=record.path,
+                        n_obs=record.n_obs,
+                        expected_width=obsm_widths.get(key),
+                    )
                 obs_columns = set(adata.obs.columns)
                 missing_columns = [
                     column
@@ -295,7 +349,7 @@ class CD4ChunkedDataset:
             finally:
                 if getattr(adata, "file", None) is not None:
                     adata.file.close()
-        return pd.concat(frames, axis=0, copy=False)
+        return pd.concat(frames, axis=0, copy=False), obsm_widths
 
     @property
     def n_obs(self) -> int:
@@ -355,7 +409,9 @@ class CD4ChunkedDataset:
         """Materialize one chunk-local slice into an ordinary AnnData piece."""
         adata = ad.read_h5ad(record.path, backed="r")
         try:
-            view = adata[local_indices, :]
+            # Backed dense HDF5 matrices require increasing, unique row indices.
+            sorted_indices, restore_indices = np.unique(local_indices, return_inverse=True)
+            view = adata[sorted_indices, :]
             obs = view.obs.copy()
             _add_donor_timepoint_column(obs)
             obs.index = _unique_obs_names(obs.index, record.chunk_key)
@@ -366,8 +422,24 @@ class CD4ChunkedDataset:
             )
             for layer_key in include_layers:
                 piece.layers[layer_key] = _copy_matrix(self._resolve_matrix(view, layer_key))
+            for key, width in self.obsm_widths.items():
+                if key not in view.obsm:
+                    raise KeyError(f"{record.path}: requested obsm[{key!r}] is missing.")
+                matrix = view.obsm[key]
+                _validate_embedding(
+                    matrix,
+                    key=key,
+                    path=record.path,
+                    n_obs=piece.n_obs,
+                    expected_width=width,
+                )
+                if sparse.issparse(matrix):
+                    matrix = matrix.toarray()
+                piece.obsm[key] = np.asarray(matrix, dtype=np.float32).copy()
             if self._log1p_uns is not None:
                 piece.uns["log1p"] = copy.deepcopy(self._log1p_uns)
+            if not np.array_equal(restore_indices, np.arange(piece.n_obs)):
+                piece = piece[restore_indices, :].copy()
             return piece
         finally:
             if getattr(adata, "file", None) is not None:
@@ -382,12 +454,17 @@ class CD4ChunkedDataset:
     ) -> ad.AnnData:
         """Materialize selected global row indices into an in-memory AnnData subset."""
         row_idx = np.asarray(indices, dtype=np.int64).ravel()
+        include_layers_tuple = tuple(dict.fromkeys(str(layer) for layer in include_layers))
         if row_idx.size == 0:
             subset = ad.AnnData(
                 X=sparse.csr_matrix((0, self.n_vars), dtype=np.float32),
                 obs=self._empty_obs_template.copy(),
                 var=self.var.copy(),
             )
+            for layer_key in include_layers_tuple:
+                subset.layers[layer_key] = sparse.csr_matrix((0, self.n_vars), dtype=np.float32)
+            for key, width in self.obsm_widths.items():
+                subset.obsm[key] = np.empty((0, width), dtype=np.float32)
             if self._log1p_uns is not None:
                 subset.uns["log1p"] = copy.deepcopy(self._log1p_uns)
             if output_path is not None:
@@ -399,7 +476,6 @@ class CD4ChunkedDataset:
         if row_idx.min() < 0 or row_idx.max() >= self.n_obs:
             raise IndexError(f"Subset indices out of bounds for dataset with n_obs={self.n_obs}.")
 
-        include_layers_tuple = tuple(dict.fromkeys(str(layer) for layer in include_layers))
         chunk_ids = np.searchsorted(self._row_ends, row_idx, side="right")
         positions_by_chunk: dict[int, list[int]] = defaultdict(list)
         for position, chunk_id in enumerate(chunk_ids.tolist()):

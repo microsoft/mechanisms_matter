@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import hashlib
+import json
 import os
 import sys
 import time
@@ -12,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any
 
 import anndata as ad
@@ -65,6 +67,18 @@ _REPLOGLE22_VARIANT_PATHS = {
     "Jurkat": "data/replogle22/Jurkat/processed.h5ad",
     "HepG2": "data/replogle22/HepG2/processed.h5ad",
 }
+_SUPPORTED_MODELS = (
+    "Control",
+    "Average",
+    "Context-Average",
+    "Context-linearPCA",
+    "linearPCA",
+    "scVI",
+    "GEARS",
+    "CPA",
+    "STATE",
+    "scLDM",
+)
 _METRIC_COLUMNS = [
     "pearson",
     "pearson_degs",
@@ -100,6 +114,7 @@ class DatasetSummary:
     n_cell_lines: int
     n_total_perturbations: int
     sparsity: float
+    basal_embedding_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,17 +147,13 @@ def _resolve_dataset_request(
                 "dataset_variant is required for dataset_name='replogle22'. "
                 f"Choose one of: {list(_REPLOGLE22_VARIANT_PATHS)}."
             )
-        if dataset_path is not None:
-            raise ValueError(
-                "Do not provide dataset_path for dataset_name='replogle22'; "
-                "the path is selected by dataset_variant."
-            )
         if dataset_variant not in _REPLOGLE22_VARIANT_PATHS:
             raise ValueError(
                 f"Unknown Replogle22 dataset_variant={dataset_variant!r}. "
                 f"Choose one of: {list(_REPLOGLE22_VARIANT_PATHS)}."
             )
-        return _REPLOGLE22_VARIANT_PATHS[dataset_variant], dataset_variant
+        resolved_path = dataset_path or _REPLOGLE22_VARIANT_PATHS[dataset_variant]
+        return resolved_path, dataset_variant
 
     if dataset_variant is not None:
         raise ValueError("dataset_variant is only supported for dataset_name='replogle22'.")
@@ -483,8 +494,6 @@ def _prepare_trial_data(
             )
         if bucket_mmd_pca_model is None:
             raise ValueError("Vendi calibration requires observed control cells.")
-        if obs_layer is None:
-            raise ValueError("Vendi calibration requires an explicit observed layer.")
         bucket_mmd_gamma = estimate_mmd_gamma(
             obs=bucket_obs_eval,
             layer_obs=obs_layer,
@@ -648,10 +657,11 @@ def _run_trial_models(
     run_cpa: Callable[[], ad.AnnData],
     run_state: Callable[[], ad.AnnData],
     run_scldm: Callable[[], ad.AnnData],
+    models: tuple[str, ...] = MODELS,
 ) -> list[dict[str, Any]]:
-    """Run every model for one prepared trial using backend-specific predictors."""
+    """Run the selected models for one prepared trial using backend-specific predictors."""
     trial_results: list[dict[str, Any]] = []
-    for model in MODELS:
+    for model in models:
         start_time = time.time()
         mu_pred = None
         ad_test_pred = None
@@ -719,14 +729,123 @@ def _trial_model_dir(
     trial_id: int,
 ) -> str:
     """Build the output directory for one trained real-experiment model."""
+    run_instance_id = os.environ.get("SLURM_JOB_ID", str(pid))
     return str(
         Path("results")
         / "real_experiments"
         / model_name
         / dataset_run_name
-        / str(pid)
+        / run_instance_id
         / f"trial_{trial_id}"
     )
+
+
+def _scldm_trial_model_dir(
+    dataset_run_name: str,
+    pid: int,
+    trial_id: int,
+) -> str:
+    """Return a stable scratch-backed scLDM directory when configured by Slurm."""
+    output_root = os.environ.get("SCLDM_OUTPUT_ROOT")
+    if output_root:
+        return str(Path(output_root) / f"trial_{trial_id}")
+    return _trial_model_dir("scLDM", dataset_run_name, pid, trial_id)
+
+
+def _guard_scldm_resume(
+    *,
+    out_dir: str,
+    dataset_run_name: str,
+    splitter: ContextSplitter,
+    trial_id: int,
+    context_axis: str,
+    counts_layer: str | None,
+    normalized_target_sum: float | None,
+    split_indices: tuple[np.ndarray, np.ndarray, np.ndarray],
+    gene_names: pd.Index,
+) -> None:
+    """
+    Guard checkpoint reuse by split/config identity, without hashing expression data.
+
+    The marker preserves the existing output layout and fails closed for legacy
+    checkpoints whose identity is unknown. It is not a lock for concurrent training.
+    """
+
+    def names_digest(names: pd.Index) -> str:
+        digest = hashlib.sha256()
+        for name in names:
+            encoded = str(name).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    identity = {
+        "version": 1,
+        "dataset": dataset_run_name,
+        "split_strategy": splitter.split_strategy,
+        "seed": trial_id,
+        "context_axis": context_axis,
+        "counts_layer": counts_layer,
+        "normalized_target_sum": normalized_target_sum,
+        "obs_names_sha256": names_digest(splitter.obs.index),
+        "gene_names_sha256": names_digest(gene_names),
+        "split_indices_sha256": {
+            name: hashlib.sha256(np.asarray(indices, dtype="<i8").tobytes()).hexdigest()
+            for name, indices in zip(("train", "val", "test"), split_indices, strict=True)
+        },
+    }
+    output = Path(out_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    marker = output / "scldm_resume_identity.json"
+
+    def verify_marker() -> None:
+        try:
+            recorded = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Invalid scLDM resume identity marker: {marker}") from exc
+        if recorded != identity:
+            raise ValueError(
+                f"scLDM resume identity mismatch in {output}; use a separate output root "
+                "for a different dataset, split, seed, or configuration."
+            )
+
+    if marker.exists():
+        verify_marker()
+        return
+    for pattern in ("*.ckpt", "vae_ckpts/*.ckpt", "ldm_ckpts/*.ckpt"):
+        if any(output.glob(pattern)):
+            raise ValueError(f"scLDM checkpoints in {output} have no resume identity marker.")
+
+    # Publish a complete marker without replacing a competing invocation's identity.
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=output, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            json.dump(identity, handle, sort_keys=True, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            try:
+                os.link(temporary, marker)
+            except FileExistsError:
+                verify_marker()
+        finally:
+            temporary.unlink()
+
+
+def _state_trial_options(dataset_run_name: str, pid: int, trial_id: int) -> dict[str, Any]:
+    """Return seed and resumable checkpoint paths for one STATE trial."""
+    output_root = os.environ.get("STATE_OUTPUT_ROOT")
+    model_dir = (
+        str(Path(output_root) / f"trial_{trial_id}")
+        if output_root
+        else _trial_model_dir("state_gene", dataset_run_name, pid, trial_id)
+    )
+    return {
+        "model_dir": model_dir,
+        "seed": trial_id,
+        "checkpoint_dir": str(Path(model_dir) / "checkpoints"),
+        "resume_from_checkpoint": "last",
+    }
 
 
 def run_one_trial(
@@ -739,8 +858,9 @@ def run_one_trial(
     pid: int,
     norm_target_sum: float,
     basal_embedding_key: str | None = None,
+    models: tuple[str, ...] = MODELS,
 ) -> list[dict[str, Any]]:
-    """Train/evaluate every model for one split and return metric rows."""
+    """Train/evaluate the selected models for one split and return metric rows."""
     train_idx, val_idx, test_idx = splitter.split(seed=trial_id)
     split_metadata = splitter.get_split_metadata()
     train_adata = adata[train_idx, :]
@@ -837,7 +957,7 @@ def run_one_trial(
             test_adata=test_adata,
             context_key=context_axis,
             dataset_name=trial_dataset_name,
-            model_dir=_trial_model_dir("state_gene", dataset_run_name, pid, trial_id),
+            **_state_trial_options(dataset_run_name, pid, trial_id),
             perturbation_column="perturbation",
             control_label="control",
             expression_layer=NORM_LAYER_KEY,
@@ -855,17 +975,29 @@ def run_one_trial(
         return pred
 
     def run_scldm_prediction() -> ad.AnnData:
+        out_dir = _scldm_trial_model_dir(dataset_run_name, pid, trial_id)
+        _guard_scldm_resume(
+            out_dir=out_dir,
+            dataset_run_name=dataset_run_name,
+            splitter=splitter,
+            trial_id=trial_id,
+            context_axis=context_axis,
+            counts_layer=counts_layer,
+            normalized_target_sum=norm_target_sum if obs_layer is not None else None,
+            split_indices=(train_idx, val_idx, test_idx),
+            gene_names=adata.var_names,
+        )
         scldm_out = run_scldm(
             train_adata=train_adata,
             val_adata=val_adata,
             test_adata=test_adata,
-            out_dir=_trial_model_dir("scLDM", dataset_run_name, pid, trial_id),
+            out_dir=out_dir,
             perturbation_column="perturbation",
             context_key=context_axis,
             control_label="control",
             num_epochs=100,
             seed=trial_id,
-            resume=False,
+            resume=True,
             counts_layer=counts_layer,
             normalized_target_sum=norm_target_sum if obs_layer is not None else None,
         )
@@ -889,6 +1021,7 @@ def run_one_trial(
         run_cpa=run_cpa_prediction,
         run_state=run_state_prediction,
         run_scldm=run_scldm_prediction,
+        models=models,
     )
 
 
@@ -896,13 +1029,19 @@ def _build_run_identifier(
     dataset_name: str,
     dataset_variant: str | None,
     split_strategy: str,
+    trial_ids: tuple[int, ...],
 ) -> str:
     """Build the shared timestamped identifier for results and caches."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_run_name = _dataset_run_name(dataset_name, dataset_variant)
+    seed_label = "seed" if len(trial_ids) == 1 else "seeds"
+    seed_values = "-".join(str(trial_id) for trial_id in trial_ids)
+    trial_suffix = f"{seed_label}-{seed_values}"
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    job_suffix = f"_job-{slurm_job_id}" if slurm_job_id else ""
     if dataset_name == "Norman19":
-        return f"{dataset_run_name}_{timestamp}"
-    return f"{dataset_run_name}_{split_strategy}_{timestamp}"
+        return f"{dataset_run_name}_{trial_suffix}_{timestamp}{job_suffix}"
+    return f"{dataset_run_name}_{split_strategy}_{trial_suffix}_{timestamp}{job_suffix}"
 
 
 def _write_results(
@@ -910,7 +1049,8 @@ def _write_results(
     all_rows: list[dict[str, Any]],
     csv_file: Path,
     error_log_file: Path,
-    n_trials: int,
+    trial_ids: tuple[int, ...],
+    models: tuple[str, ...],
 ) -> str:
     """Persist results rows and summarize trial-level success/failure counts."""
     results_df = pd.DataFrame(all_rows)
@@ -921,7 +1061,7 @@ def _write_results(
         if not failed_df.empty:
             with error_log_file.open("w", encoding="utf-8") as handle:
                 for _, row in failed_df.iterrows():
-                    handle.write(f"Trial {int(row['trial_id']) + 1} ({row['model']}) failed\n")
+                    handle.write(f"Trial seed {int(row['trial_id'])} ({row['model']}) failed\n")
                     handle.write(f"Error: {row.get('error', 'Unknown error')}\n")
                     handle.write("-" * 80 + "\n")
             print(f"Some trials failed. Error log: {error_log_file}")
@@ -929,11 +1069,12 @@ def _write_results(
     success_trials = 0
     if "status" in results_df.columns and "model" in results_df.columns:
         success_trials = int(
-            results_df[(results_df["status"] == "success") & (results_df["model"] == MODELS[0])][
+            results_df[(results_df["status"] == "success") & (results_df["model"] == models[0])][
                 "trial_id"
             ].nunique()
         )
-    failed_trials = int(n_trials) - int(success_trials)
+    n_trials = len(trial_ids)
+    failed_trials = n_trials - int(success_trials)
 
     print(f"Done. Results saved to: {csv_file}")
     print(f"Success: {success_trials}/{n_trials} trials")
@@ -943,7 +1084,8 @@ def _write_results(
 
 def _execute_trial_loop(
     *,
-    n_trials: int,
+    trial_ids: tuple[int, ...],
+    models: tuple[str, ...],
     splitter: ContextSplitter,
     summary: DatasetSummary,
     run_trial: Any,
@@ -958,11 +1100,12 @@ def _execute_trial_loop(
         "n_cell_lines": int(summary.n_cell_lines),
         "n_total_perturbations": int(summary.n_total_perturbations),
         "sparsity": summary.sparsity,
+        "basal_embedding_key": summary.basal_embedding_key,
     }
 
     all_rows: list[dict[str, Any]] = []
-    for trial_id in range(int(n_trials)):
-        print(f"Trial {trial_id + 1}/{n_trials}")
+    for trial_number, trial_id in enumerate(trial_ids, start=1):
+        print(f"Trial seed {trial_id} ({trial_number}/{len(trial_ids)})")
         try:
             trial_rows = run_trial(trial_id)
             for row in trial_rows:
@@ -981,7 +1124,7 @@ def _execute_trial_loop(
                 for context in build_evaluation_contexts(splitter, seed=trial_id)
             ]
             for context_axis, context_values in error_contexts:
-                for model in MODELS:
+                for model in models:
                     row = error_row.copy()
                     row["model"] = model
                     row["context_axis"] = context_axis
@@ -1016,7 +1159,8 @@ def _run_real_experiments_with_runtime(
     dataset_variant: str | None,
     dataset_path: str,
     output_dir: str,
-    n_trials: int,
+    trial_ids: tuple[int, ...],
+    models: tuple[str, ...],
     split_strategy: str,
     splitter_adata: Any,
     n_obs: int,
@@ -1025,6 +1169,7 @@ def _run_real_experiments_with_runtime(
     sparsity: float,
     run_trial: Callable[[ContextSplitter, int], list[dict[str, Any]]],
     extra_log_lines: tuple[str, ...] = (),
+    basal_embedding_key: str | None = None,
 ) -> str:
     """Run the shared real-experiment loop once the dataset/runtime is prepared."""
     output_dir_path = Path(output_dir)
@@ -1034,6 +1179,7 @@ def _run_real_experiments_with_runtime(
         dataset_name,
         dataset_variant,
         split_strategy,
+        trial_ids,
     )
     csv_file = output_dir_path / f"results_{identifier}.csv"
     error_log_file = output_dir_path / f"error_log_{identifier}.txt"
@@ -1054,7 +1200,7 @@ def _run_real_experiments_with_runtime(
     print(f"Perturbations (non-control): {n_total_perturbations}")
     for log_line in extra_log_lines:
         print(log_line)
-    print(f"Running {n_trials} trials sequentially (no multiprocessing).")
+    print(f"Running {len(trial_ids)} trial(s) sequentially with seeds={list(trial_ids)}.")
 
     summary = DatasetSummary(
         dataset=dataset_name,
@@ -1065,6 +1211,7 @@ def _run_real_experiments_with_runtime(
         n_cell_lines=n_context_values,
         n_total_perturbations=n_total_perturbations,
         sparsity=sparsity,
+        basal_embedding_key=basal_embedding_key,
     )
     splitter = ContextSplitter(
         adata=splitter_adata,
@@ -1073,7 +1220,8 @@ def _run_real_experiments_with_runtime(
         test_context_values=context_config.heldout_values,
     )
     all_rows = _execute_trial_loop(
-        n_trials=int(n_trials),
+        trial_ids=trial_ids,
+        models=models,
         splitter=splitter,
         summary=summary,
         run_trial=lambda trial_id: run_trial(splitter, trial_id),
@@ -1083,7 +1231,8 @@ def _run_real_experiments_with_runtime(
         all_rows=all_rows,
         csv_file=csv_file,
         error_log_file=error_log_file,
-        n_trials=int(n_trials),
+        trial_ids=trial_ids,
+        models=models,
     )
 
 
@@ -1186,8 +1335,14 @@ def run_one_trial_cd4_chunked(
     pid: int,
     norm_target_sum: float | None,
     split_cache_parent: Path,
+    models: tuple[str, ...] = MODELS,
+    basal_embedding_key: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Train/evaluate one CD4 trial without building a full-dataset AnnData."""
+    """Train/evaluate selected models for one CD4 trial without a full-dataset AnnData."""
+    if basal_embedding_key is not None and basal_embedding_key not in runtime.obsm_widths:
+        raise ValueError(
+            f"CD4 runtime was not loaded with required_obsm_keys=({basal_embedding_key!r},)."
+        )
     train_idx, val_idx, test_idx = splitter.split(seed=trial_id)
     split_metadata = splitter.get_split_metadata()
     context_axis = split_metadata.context_axis
@@ -1308,11 +1463,12 @@ def run_one_trial_cd4_chunked(
                     test_adata=test_split,
                     context_key=context_axis,
                     dataset_name=trial_dataset_name,
-                    model_dir=_trial_model_dir("state_gene", dataset_run_name, pid, trial_id),
+                    **_state_trial_options(dataset_run_name, pid, trial_id),
                     perturbation_column="perturbation",
                     control_label="control",
                     expression_layer=None,
                     epochs=100,
+                    basal_embedding_key=basal_embedding_key,
                 ),
             )
             state_pred = np.asarray(state_out["preds"], dtype=np.float32)
@@ -1328,19 +1484,31 @@ def run_one_trial_cd4_chunked(
         def run_scldm_prediction() -> ad.AnnData:
             if counts_layer is None:
                 raise ValueError("scLDM requires a raw-count layer for chunked CD4+ data.")
+            out_dir = _scldm_trial_model_dir(dataset_run_name, pid, trial_id)
+            _guard_scldm_resume(
+                out_dir=out_dir,
+                dataset_run_name=dataset_run_name,
+                splitter=splitter,
+                trial_id=trial_id,
+                context_axis=context_axis,
+                counts_layer=counts_layer,
+                normalized_target_sum=norm_target_sum if obs_layer is not None else None,
+                split_indices=(train_idx, val_idx, test_idx),
+                gene_names=runtime.var_names,
+            )
             scldm_out = _run_model_from_cd4_split_cache(
                 split_paths=split_paths,
                 run_model=lambda train_split, val_split, test_split: run_scldm(
                     train_adata=train_split,
                     val_adata=val_split,
                     test_adata=test_split,
-                    out_dir=_trial_model_dir("scLDM", dataset_run_name, pid, trial_id),
+                    out_dir=out_dir,
                     perturbation_column="perturbation",
                     context_key=context_axis,
                     control_label="control",
                     num_epochs=100,
                     seed=trial_id,
-                    resume=False,
+                    resume=True,
                     counts_layer=counts_layer,
                     normalized_target_sum=(norm_target_sum if obs_layer is not None else None),
                 ),
@@ -1365,6 +1533,7 @@ def run_one_trial_cd4_chunked(
             run_cpa=run_cpa_prediction,
             run_state=run_state_prediction,
             run_scldm=run_scldm_prediction,
+            models=models,
         )
 
 
@@ -1373,7 +1542,8 @@ def _run_real_experiments_h5ad(
     dataset_variant: str | None,
     dataset_path: str,
     output_dir: str,
-    n_trials: int,
+    trial_ids: tuple[int, ...],
+    models: tuple[str, ...],
     counts_layer: str | None,
     obs_layer: str | None,
     split_strategy: str,
@@ -1419,13 +1589,15 @@ def _run_real_experiments_h5ad(
         dataset_variant=dataset_variant,
         dataset_path=dataset_path,
         output_dir=output_dir,
-        n_trials=n_trials,
+        trial_ids=trial_ids,
+        models=models,
         split_strategy=split_strategy,
         splitter_adata=adata,
         n_obs=int(adata.n_obs),
         n_vars=int(adata.n_vars),
         n_total_perturbations=len(label_mapping),
         sparsity=_dataset_sparsity(adata),
+        basal_embedding_key=basal_embedding_key,
         run_trial=lambda splitter, trial_id: run_one_trial(
             adata=adata,
             splitter=splitter,
@@ -1436,6 +1608,7 @@ def _run_real_experiments_h5ad(
             pid=pid,
             norm_target_sum=norm_target_sum,
             basal_embedding_key=basal_embedding_key,
+            models=models,
         ),
     )
 
@@ -1445,19 +1618,32 @@ def _run_real_experiments_cd4_chunked(
     dataset_variant: str | None,
     dataset_path: str,
     output_dir: str,
-    n_trials: int,
+    trial_ids: tuple[int, ...],
+    models: tuple[str, ...],
     counts_layer: str | None,
     obs_layer: str | None,
     split_strategy: str,
     norm_target_sum: float,
+    basal_embedding_key: str | None = None,
 ) -> str:
     """Run the chunk-aware CD4 workflow from a manifest JSON."""
     pid = os.getpid()
     dataset_run_name = _dataset_run_name(dataset_name, dataset_variant)
-    split_cache_parent = Path(output_dir) / _CD4_SPLIT_CACHE_DIRNAME
+    slurm_tmpdir = os.environ.get("SLURM_TMPDIR")
+    split_cache_root = os.environ.get("CD4_SPLIT_CACHE_ROOT")
+    split_cache_parent = (
+        Path(split_cache_root)
+        if split_cache_root
+        else (
+            Path(slurm_tmpdir) / _CD4_SPLIT_CACHE_DIRNAME
+            if slurm_tmpdir
+            else Path(output_dir) / _CD4_SPLIT_CACHE_DIRNAME
+        )
+    )
     split_cache_parent.mkdir(parents=True, exist_ok=True)
 
-    runtime = CD4ChunkedDataset.from_manifest(dataset_path)
+    required_obsm_keys = (basal_embedding_key,) if basal_embedding_key is not None else ()
+    runtime = CD4ChunkedDataset.from_manifest(dataset_path, required_obsm_keys=required_obsm_keys)
     if counts_layer is not None and not runtime.has_source_layer(counts_layer):
         raise KeyError(
             f"Requested counts_layer='{counts_layer}' not found in CD4 chunks. "
@@ -1481,13 +1667,15 @@ def _run_real_experiments_cd4_chunked(
         dataset_variant=dataset_variant,
         dataset_path=dataset_path,
         output_dir=output_dir,
-        n_trials=n_trials,
+        trial_ids=trial_ids,
+        models=models,
         split_strategy=split_strategy,
         splitter_adata=runtime,
         n_obs=int(runtime.n_obs),
         n_vars=int(runtime.n_vars),
         n_total_perturbations=len(label_mapping),
         sparsity=runtime.dataset_sparsity(obs_layer),
+        basal_embedding_key=basal_embedding_key,
         run_trial=lambda splitter, trial_id: run_one_trial_cd4_chunked(
             runtime=runtime,
             splitter=splitter,
@@ -1498,11 +1686,48 @@ def _run_real_experiments_cd4_chunked(
             pid=pid,
             norm_target_sum=norm_target_sum,
             split_cache_parent=split_cache_parent,
+            models=models,
+            basal_embedding_key=basal_embedding_key,
         ),
         extra_log_lines=(
             f"CD4 trial split caches are temporary directories under: {split_cache_parent}",
+            f"Basal embedding key: {basal_embedding_key!r}; widths: {runtime.obsm_widths}",
         ),
     )
+
+
+def _resolve_trial_ids(
+    *,
+    n_trials: int,
+    trial_ids: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    """Resolve either the legacy trial count or explicit reproducible seed IDs."""
+    if trial_ids is None:
+        if int(n_trials) <= 0:
+            raise ValueError("n_trials must be positive.")
+        return tuple(range(int(n_trials)))
+
+    resolved = tuple(int(trial_id) for trial_id in trial_ids)
+    if not resolved:
+        raise ValueError("trial_ids must contain at least one seed.")
+    if any(trial_id < 0 for trial_id in resolved):
+        raise ValueError(f"trial_ids must be non-negative; received {resolved}.")
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f"trial_ids must be unique; received {resolved}.")
+    return resolved
+
+
+def _resolve_models(models: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate the model subset requested for one benchmark invocation."""
+    resolved = tuple(models)
+    if not resolved:
+        raise ValueError("At least one model must be selected.")
+    unknown = tuple(model for model in resolved if model not in _SUPPORTED_MODELS)
+    if unknown:
+        raise ValueError(f"Unsupported model(s) {unknown}. Choose from: {list(_SUPPORTED_MODELS)}.")
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f"Models must be unique; received {resolved}.")
+    return resolved
 
 
 def run_real_experiments(
@@ -1516,8 +1741,12 @@ def run_real_experiments(
     norm_target_sum: float,
     dataset_variant: str | None = None,
     basal_embedding_key: str | None = None,
+    trial_ids: tuple[int, ...] | None = None,
+    models: tuple[str, ...] = MODELS,
 ) -> str:
     """Run all trials for one real dataset and write results/log files."""
+    resolved_trial_ids = _resolve_trial_ids(n_trials=n_trials, trial_ids=trial_ids)
+    resolved_models = _resolve_models(models)
     dataset_path, dataset_variant = _resolve_dataset_request(
         dataset_name=dataset_name,
         dataset_variant=dataset_variant,
@@ -1532,18 +1761,21 @@ def run_real_experiments(
             dataset_variant=dataset_variant,
             dataset_path=dataset_path,
             output_dir=output_dir,
-            n_trials=n_trials,
+            trial_ids=resolved_trial_ids,
+            models=resolved_models,
             counts_layer=counts_layer,
             obs_layer=obs_layer,
             split_strategy=split_strategy,
             norm_target_sum=norm_target_sum,
+            basal_embedding_key=basal_embedding_key,
         )
     return _run_real_experiments_h5ad(
         dataset_name=dataset_name,
         dataset_variant=dataset_variant,
         dataset_path=dataset_path,
         output_dir=output_dir,
-        n_trials=n_trials,
+        trial_ids=resolved_trial_ids,
+        models=resolved_models,
         counts_layer=counts_layer,
         obs_layer=obs_layer,
         split_strategy=split_strategy,
@@ -1573,9 +1805,30 @@ def real_exp_args(description: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset_path",
         type=str,
-        help="Input dataset path. Omit for Replogle22 and the default Norman19 dataset.",
+        help=(
+            "Optional input dataset path. Omit it to use the default Norman19 or "
+            "Replogle22 variant path."
+        ),
     )
-    parser.add_argument("--n_trials", type=int, default=10)
+    parser.add_argument(
+        "--n_trials",
+        type=int,
+        default=10,
+        help="Number of sequential trials using seeds 0..n_trials-1 (default: 10).",
+    )
+    parser.add_argument(
+        "--trial_id",
+        type=int,
+        default=None,
+        help="Run exactly one explicit non-negative trial seed; overrides --n_trials.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=list(_SUPPORTED_MODELS),
+        default=None,
+        help="Run one explicit model instead of the model tuple configured in analyses.common.",
+    )
 
     parser.add_argument(
         "--counts_layer",
@@ -1631,6 +1884,8 @@ def main() -> None:
     basal_embedding_key = (
         None if str(args.basal_embedding_key).lower() in ("none", "") else args.basal_embedding_key
     )
+    trial_ids = None if args.trial_id is None else (int(args.trial_id),)
+    models = MODELS if args.model is None else (str(args.model),)
 
     run_real_experiments(
         dataset_name=args.dataset_name,
@@ -1643,6 +1898,8 @@ def main() -> None:
         split_strategy=args.split_strategy,
         norm_target_sum=float(args.norm_target_sum),
         basal_embedding_key=basal_embedding_key,
+        trial_ids=trial_ids,
+        models=models,
     )
 
 
