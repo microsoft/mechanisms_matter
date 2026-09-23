@@ -931,9 +931,9 @@ def run_random_sweep(
 
     success_count = (
         int(
-            results_df[(results_df["status"] == "success") & (results_df["model"] == selected_models[0])][
-                "trial_id"
-            ].nunique()
+            results_df[
+                (results_df["status"] == "success") & (results_df["model"] == selected_models[0])
+            ]["trial_id"].nunique()
         )
         if "status" in results_df
         else 0
@@ -1024,7 +1024,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--multiprocessing", action="store_true", help="Enable multiprocessing")
     parser.add_argument(
-        "--models", nargs="+", choices=MODELS, default=None,
+        "--models",
+        nargs="+",
+        choices=MODELS,
+        default=None,
         help="Models to run (default: all configured models)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")

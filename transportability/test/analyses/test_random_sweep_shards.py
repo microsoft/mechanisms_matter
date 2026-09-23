@@ -93,13 +93,20 @@ class RandomSweepShardTests(unittest.TestCase):
     def test_selected_models_reach_workers_and_failure_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             with patch.object(sweep, "MODELS", ("Control", "scLDM")):
-                with patch.object(sweep, "simulate_one_run", side_effect=ValueError("failed")) as run:
+                with patch.object(
+                    sweep, "simulate_one_run", side_effect=ValueError("failed")
+                ) as run:
                     result = sweep.run_random_sweep(
-                        dataset_name="directDGP", n_trials=1, output_dir=temporary_dir,
-                        models=("scLDM",), control_mu=np.ones(128),
-                        all_theta=np.ones(128), pert_mu=np.ones(128),
+                        dataset_name="directDGP",
+                        n_trials=1,
+                        output_dir=temporary_dir,
+                        models=("scLDM",),
+                        control_mu=np.ones(128),
+                        all_theta=np.ones(128),
+                        pert_mu=np.ones(128),
                         gene_names=np.asarray([f"gene{i}" for i in range(128)]),
-                        rng=np.random.default_rng(42), use_multiprocessing=False,
+                        rng=np.random.default_rng(42),
+                        use_multiprocessing=False,
                     )
         self.assertEqual(run.call_args.kwargs["models"], ("scLDM",))
         self.assertEqual(result["model"].tolist(), ["scLDM"])
