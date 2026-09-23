@@ -221,7 +221,7 @@ def plot_metric_vs_parameter(
     use_loess=False,
 ):
     """Generic scatter + moving-average plot with Pearson correlation annotation."""
-    _, ax = plt.subplots(figsize=(7, 6))
+    _, ax = plt.subplots(figsize=(10, 6) if color_by_model else (7, 6))
     if y_label is None:
         y_label = metric_label(y_column)
     scatter_plot_values: list[np.ndarray] = []
@@ -352,7 +352,13 @@ def plot_metric_vs_parameter(
             )
             for model_name in plotted_models
         ]
-        ax.legend(handles=legend_handles, title="Model", loc="best")
+        ax.legend(
+            handles=legend_handles,
+            title="Model",
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+        )
 
     # Remove top and right spines
     sns.despine()

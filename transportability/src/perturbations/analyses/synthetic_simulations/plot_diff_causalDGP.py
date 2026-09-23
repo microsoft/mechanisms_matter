@@ -14,6 +14,7 @@ from matplotlib.lines import Line2D
 
 from ..plot_utils import (
     COMMON_METRIC_LABELS,
+    EXPECTED_MODEL_ORDER,
     MODEL_COLORS,
     apply_paper_plot_style,
     coerce_numeric,
@@ -457,7 +458,8 @@ def main() -> None:
             data
             for change_results in split_change_results.values()
             for data in change_results.values()
-        ]
+        ],
+        expected_order=(*EXPECTED_MODEL_ORDER, "scLDM"),
     )
     print(f"Models available across inputs: {model_order}")
 

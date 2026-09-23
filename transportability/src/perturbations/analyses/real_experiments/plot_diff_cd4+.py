@@ -15,9 +15,10 @@ from matplotlib.lines import Line2D
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ...analyses.plot_utils import (
+from ..plot_utils import (
     COMMON_METRIC_LABELS,
-    MODEL_COLORS,
+    EXPECTED_MODEL_ORDER,
+    MODEL_COLORS as COMMON_MODEL_COLORS,
     apply_paper_plot_style,
     coerce_numeric,
     metric_axis_label,
@@ -27,6 +28,9 @@ from ...analyses.plot_utils import (
 )
 
 apply_paper_plot_style()
+
+CD4_MODEL_ORDER: tuple[str, ...] = (*EXPECTED_MODEL_ORDER, "STATE-Geneformer", "scLDM")
+MODEL_COLORS: dict[str, str] = {**COMMON_MODEL_COLORS, "STATE-Geneformer": "#7f7f7f"}
 
 CONTEXT_ORDER: tuple[str, ...] = (
     "D2_Rest",
@@ -420,7 +424,9 @@ def main() -> None:
 
     in_context_data = prepare_results_data(pd.read_csv(in_context_path))
     cross_context_data = prepare_results_data(pd.read_csv(cross_context_path))
-    model_order = resolve_expected_model_order(in_context_data, cross_context_data)
+    model_order = resolve_expected_model_order(
+        in_context_data, cross_context_data, expected_order=CD4_MODEL_ORDER
+    )
     print(f"Models: {model_order}")
 
     output_dir = (

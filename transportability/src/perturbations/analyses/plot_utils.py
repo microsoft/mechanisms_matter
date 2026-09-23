@@ -69,6 +69,7 @@ MODEL_COLORS: dict[str, str] = {
     "GEARS": "#9c755f",
     "CPA": "#3c5488",
     "STATE": "#b07aa1",
+    "scLDM": "#d4a017",
 }
 COMMON_METRIC_LABELS: dict[str, str] = {
     "pearson": "Pearson",

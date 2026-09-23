@@ -11,6 +11,7 @@ import pandas as pd
 from ..plot_utils import (
     COMMON_METRIC_BASE_COLORS,
     COMMON_METRIC_LABELS,
+    EXPECTED_MODEL_ORDER,
     MODEL_TICK_LABEL_ALIGNMENT,
     MODEL_TICK_LABEL_ROTATION,
     apply_paper_plot_style,
@@ -24,13 +25,16 @@ from ..plot_utils import (
 
 apply_paper_plot_style()
 
+REAL_MODEL_ORDER: tuple[str, ...] = (*EXPECTED_MODEL_ORDER, "STATE (geneformer)", "scLDM")
+MODEL_LABEL_ALIASES: dict[str, str] = {"STATE-Geneformer": "STATE (geneformer)"}
+
 PAIR_METRIC_GROUPS: tuple[tuple[str, str], ...] = (
     ("pearson", "pearson_degs"),
     ("mae", "mae_degs"),
     ("mse", "mse_degs"),
     ("r2", "r2_degs"),
 )
-DES_METRICS: tuple[str, ...] = ("des_recall", "des_precision", "des_jaccard")
+DES_METRICS: tuple[str, ...] = ("des_overlap", "des_recall", "des_precision", "des_jaccard")
 SINGLE_METRICS: tuple[str, ...] = (
     "parametric_distance",
     "mmd_distance",
@@ -54,8 +58,14 @@ NUMERIC_RESULT_COLUMNS: tuple[str, ...] = (
     "vendi_score_obs",
 )
 
-METRIC_LABELS: dict[str, str] = COMMON_METRIC_LABELS
-METRIC_BASE_COLORS: dict[str, str] = COMMON_METRIC_BASE_COLORS
+METRIC_LABELS: dict[str, str] = {
+    **COMMON_METRIC_LABELS,
+    "des_overlap": "DES (Legacy Overlap)",
+}
+METRIC_BASE_COLORS: dict[str, str] = {
+    **COMMON_METRIC_BASE_COLORS,
+    "des_overlap": "#8c6d31",
+}
 
 
 def latest_results_file(search_dir: Path) -> Path:
@@ -79,7 +89,7 @@ def resolve_results_path(results_arg: str | None) -> Path:
 def prepare_results_data(df: pd.DataFrame) -> pd.DataFrame:
     """Clean and validate raw results before plotting."""
     prepared = df.copy()
-    prepared["model"] = prepared["model"].astype("string").str.strip()
+    prepared["model"] = prepared["model"].astype("string").str.strip().replace(MODEL_LABEL_ALIASES)
     before = len(prepared)
     prepared = prepared[prepared["status"].astype(str).str.lower() == "success"].copy()
     print(f"Kept successful runs: {len(prepared)}/{before}")
@@ -126,7 +136,7 @@ def save_boxplot(
         metric_labels=METRIC_LABELS,
         metric_base_colors=METRIC_BASE_COLORS,
         cluster_gap=cluster_gap,
-        fig_size=(8.0, 5.8),
+        fig_size=(max(8.0, 1.05 * len(model_order)), 5.8),
         metric_limits=metric_limits,
         dpi=dpi,
         no_model_message=None,
@@ -179,7 +189,7 @@ def main() -> None:
 
     df = filter_context(prepare_results_data(pd.read_csv(results_path)), args.context_value)
 
-    model_order = resolve_expected_model_order(df, require_all_expected=True)
+    model_order = resolve_expected_model_order(df, expected_order=REAL_MODEL_ORDER)
     print(f"Models: {model_order}")
 
     metric_limits: dict[str, tuple[float, float]] | None = None

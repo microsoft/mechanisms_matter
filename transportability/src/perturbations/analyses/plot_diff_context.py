@@ -11,6 +11,7 @@ import pandas as pd
 
 from .plot_utils import (
     COMMON_METRIC_LABELS,
+    EXPECTED_MODEL_ORDER,
     MODEL_TICK_LABEL_ALIGNMENT,
     MODEL_TICK_LABEL_ROTATION,
     apply_paper_plot_style,
@@ -292,7 +293,11 @@ def main() -> None:
         args.context_value,
         label="cross-context",
     )
-    model_order = resolve_expected_model_order(in_context_data, cross_context_data)
+    model_order = resolve_expected_model_order(
+        in_context_data,
+        cross_context_data,
+        expected_order=(*EXPECTED_MODEL_ORDER, "STATE-Geneformer", "scLDM"),
+    )
     print(f"Models available across inputs: {model_order}")
 
     output_dir = output_dir_for_comparison(in_context_path, cross_context_path, args.context_value)
