@@ -206,6 +206,7 @@ def simulate_one_run(
     trial_id_for_rng: int | None = None,  # Optional for seeding RNG per trial,
     normalize: bool = True,  # Whether to normalize the data
     split_strategy: str = "in-context",  # Data splitting strategy for evaluation
+    models: tuple[str, ...] | None = None,
 ):
     """Simulate one synthetic experiment using a single in-memory AnnData object."""
     if dataset_name == "directDGP" and split_strategy == "cross-context":
@@ -491,7 +492,7 @@ def simulate_one_run(
         )
 
     all_results = []
-    for model in MODELS:
+    for model in MODELS if models is None else models:
         start_time = time.time()
         mu_pred = None
         ad_test_pred = None
@@ -723,6 +724,8 @@ def _pool_worker_timed(task_info_dict):
     params_for_sim["split_strategy"] = split_strategy
     params_for_sim["diversity_type"] = diversity_type
     params_for_sim["pid"] = pid
+    selected_models = tuple(task_info_dict.get("models", MODELS))
+    params_for_sim["models"] = selected_models
     params_for_sim["control_mu"] = control_mu_from_main
     params_for_sim["all_theta"] = all_theta_from_main
     params_for_sim["pert_mu"] = pert_mu_from_main
@@ -794,7 +797,7 @@ def _pool_worker_timed(task_info_dict):
 
         final_error_rows = []
         for context_axis, context_values in error_contexts:
-            for model in MODELS:
+            for model in selected_models:
                 final_error_rows.append(
                     {
                         **params_dict,  # original sampled params
@@ -827,12 +830,18 @@ def run_random_sweep(
     use_multiprocessing=True,
     split_strategy="in-context",
     trial_start=0,
+    models=None,
 ) -> pd.DataFrame:
     """Run random synthetic sweeps and save results plus error logs."""
     if n_trials < 1:
         raise ValueError("n_trials must be positive.")
     if trial_start < 0:
         raise ValueError("trial_start must be non-negative.")
+    selected_models = tuple(MODELS if models is None else models)
+    if not selected_models or len(set(selected_models)) != len(selected_models):
+        raise ValueError("models must be a nonempty selection without duplicates.")
+    if any(model not in MODELS for model in selected_models):
+        raise ValueError(f"models must be selected from {MODELS}.")
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     if rng is None:
@@ -878,6 +887,7 @@ def run_random_sweep(
                 "split_strategy": split_strategy,
                 "diversity_type": diversity_type,
                 "pid": pid,
+                "models": selected_models,
             }
         )
     tasks_for_pool = order_tasks_for_pool(tasks_for_pool)
@@ -921,7 +931,7 @@ def run_random_sweep(
 
     success_count = (
         int(
-            results_df[(results_df["status"] == "success") & (results_df["model"] == MODELS[0])][
+            results_df[(results_df["status"] == "success") & (results_df["model"] == selected_models[0])][
                 "trial_id"
             ].nunique()
         )
@@ -1013,6 +1023,10 @@ if __name__ == "__main__":
         help="Number of worker processes for multiprocessing",
     )
     parser.add_argument("--multiprocessing", action="store_true", help="Enable multiprocessing")
+    parser.add_argument(
+        "--models", nargs="+", choices=MODELS, default=None,
+        help="Models to run (default: all configured models)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
         "--dataset",
@@ -1067,6 +1081,7 @@ if __name__ == "__main__":
         use_multiprocessing=args.multiprocessing,
         split_strategy=args.split_strategy,
         trial_start=args.trial_start,
+        models=args.models,
     )
     if results_df.empty or (results_df["status"] != "success").any():
         raise SystemExit(1)
