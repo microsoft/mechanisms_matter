@@ -58,8 +58,10 @@ from ..util import (
 )
 from .sampling import (
     ALL_PARAMS_PATH,
+    DEMO_PARAM_RANGES,
     PARAM_RANGES,
     load_parameter_estimation_inputs,
+    make_demo_parameter_inputs,
     sample_parameters,
 )
 
@@ -831,6 +833,7 @@ def run_random_sweep(
     split_strategy="in-context",
     trial_start=0,
     models=None,
+    param_ranges: dict[str, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Run random synthetic sweeps and save results plus error logs."""
     if n_trials < 1:
@@ -874,11 +877,12 @@ def run_random_sweep(
         )
 
     tasks_for_pool = []
+    selected_ranges = PARAM_RANGES if param_ranges is None else param_ranges
     # Advance the same parameter stream so separate shards match an unsharded sweep.
     for _ in range(trial_start):
-        sample_parameters(PARAM_RANGES, rng)
+        sample_parameters(selected_ranges, rng)
     for i in range(trial_start, trial_start + n_trials):
-        params = sample_parameters(PARAM_RANGES, rng)
+        params = sample_parameters(selected_ranges, rng)
         tasks_for_pool.append(
             {
                 "trial_id": i,
@@ -1002,8 +1006,17 @@ def run_random_sweep(
     return results_df
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    """Run a fitted-parameter sweep or a self-contained synthetic demo."""
     parser = argparse.ArgumentParser(description="Run random sweep simulations.")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "Use generated inputs with 64 genes and 8 perturbations, without data downloads "
+            "or fitted CSVs. Defaults to Control, Average, and linearPCA models."
+        ),
+    )
     parser.add_argument("--n_trials", type=int, default=4, help="Number of trials to run")
     parser.add_argument(
         "--trial_start",
@@ -1028,7 +1041,7 @@ if __name__ == "__main__":
         nargs="+",
         choices=MODELS,
         default=None,
-        help="Models to run (default: all configured models)",
+        help="Models to run (default: demo baselines with --demo, otherwise all configured models)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
@@ -1052,14 +1065,25 @@ if __name__ == "__main__":
         choices=["A", "b", "both", "none"],
         help="Type of diversity to introduce for causalDGP dataset",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     rng = np.random.default_rng(args.seed)
 
-    synthetic_inputs = load_parameter_estimation_inputs()
-
-    print("Using theta estimates from all cells combined")
-    print(f"Loaded synthetic parameter estimates from '{ALL_PARAMS_PATH}'.")
+    if args.demo:
+        synthetic_inputs = make_demo_parameter_inputs()
+        print("Using generated demo inputs: 64 genes, 8 perturbations.")
+    else:
+        try:
+            synthetic_inputs = load_parameter_estimation_inputs()
+        except FileNotFoundError as error:
+            parser.error(
+                f"Missing fitted input file: {error.filename}. "
+                "Use --demo for the self-contained quickstart, or generate the fitted CSVs "
+                "with perturbations.analyses.synthetic_simulations.parameter_estimation as described "
+                "in the README."
+            )
+        print("Using theta estimates from all cells combined")
+        print(f"Loaded synthetic parameter estimates from '{ALL_PARAMS_PATH}'.")
 
     control_mu = synthetic_inputs["control_mu"]
     pert_mu = synthetic_inputs["pert_mu"]
@@ -1084,7 +1108,16 @@ if __name__ == "__main__":
         use_multiprocessing=args.multiprocessing,
         split_strategy=args.split_strategy,
         trial_start=args.trial_start,
-        models=args.models,
+        models=(
+            ("Control", "Average", "linearPCA")
+            if args.demo and args.models is None
+            else args.models
+        ),
+        param_ranges=DEMO_PARAM_RANGES if args.demo else None,
     )
     if results_df.empty or (results_df["status"] != "success").any():
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

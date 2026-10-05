@@ -122,16 +122,51 @@ The analysis modules use paths relative to the package source directory. After s
 cd src/perturbations
 ```
 
-Run a small synthetic sweep:
+Run a self-contained synthetic quickstart on CPU:
 
 ```bash
-uv run --locked python -m perturbations.analyses.synthetic_simulations.random_sweep \
+uv --no-config run --locked python -m perturbations.analyses.synthetic_simulations.random_sweep \
+  --demo \
   --n_trials 2 \
   --dataset causalDGP \
   --split_strategy in-context \
   --diversity_type A \
-  --models Control Average linearPCA
+  --models Control Average linearPCA \
+  --output_dir results/synthetic_quickstart
 ```
+
+The demo generates illustrative parameter arrays in memory and uses 64 genes,
+eight perturbations, 64 control cells, and 32 cells per perturbation in each
+context. It requires no datasets, fitted CSVs, model downloads, or GPU. It runs
+the simulator, context splitting, baseline predictions, and evaluation, and writes
+a `results_*.csv` under `results/synthetic_quickstart/`. Successful runs report
+`Success: 2/2 trials`, `Failed: 0/2 trials`, and `status=success` in the CSV.
+Use `--dataset directDGP` to exercise the direct simulator, or
+`--split_strategy cross-context` with `causalDGP` to exercise transportability.
+On Alliance HPC, run inside Slurm and set `--output_dir` to a directory on
+`$SCRATCH`. To run outside the checkout, use the installed environment's
+`python -m perturbations.analyses.synthetic_simulations.random_sweep`, or pass
+`--project <repository-path>/transportability` to `uv run`.
+
+For paper-scale sweeps, generate fitted inputs from Norman19 first. From
+`transportability/src/perturbations/`, run these steps. On Alliance HPC, use a
+compute allocation and a working directory on `$SCRATCH` with the same `data/`
+and `results/` layout. Outside the checkout, also pass
+`--project <repository-path>/transportability` to both commands:
+
+```bash
+uv --no-config run --locked python -m perturbations.data.norman19.get_data
+uv --no-config run --locked python -m perturbations.analyses.synthetic_simulations.parameter_estimation
+```
+
+Preprocessing creates `data/norman19/norman19_processed.h5ad` and
+`data/norman19/norman19_genes.csv.gz`. Parameter estimation creates
+`control_fitted_params.csv`, `perturbed_fitted_params.csv`, and
+`all_fitted_params.csv` under `results/synthetic_simulations/parameter_estimation/`.
+These generated files are ignored by Git. Run `random_sweep` without `--demo`
+from the same working directory to use the fitted parameters and the paper-scale
+sampling ranges. The demo's illustrative inputs are for checking the pipeline;
+paper experiments use the fitted inputs.
 
 Run real-data experiments:
 

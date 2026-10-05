@@ -17,11 +17,30 @@ PARAM_RANGES = {
     "B": {"type": "float", "min": 0.0, "max": 2.0},
     "mu_l": {"type": "float", "min": 0.2, "max": 5.0},
 }
+DEMO_PARAM_RANGES = {
+    **PARAM_RANGES,
+    "G": {"type": "fixed", "value": 64},
+    "N0": {"type": "fixed", "value": 64},
+    "Nk": {"type": "fixed", "value": 32},
+    "P": {"type": "fixed", "value": 8},
+}
 CONTROL_PARAMS_PATH = "results/synthetic_simulations/parameter_estimation/control_fitted_params.csv"
 PERTURBED_PARAMS_PATH = (
     "results/synthetic_simulations/parameter_estimation/perturbed_fitted_params.csv"
 )
 ALL_PARAMS_PATH = "results/synthetic_simulations/parameter_estimation/all_fitted_params.csv"
+
+
+def make_demo_parameter_inputs() -> dict[str, np.ndarray]:
+    """Generate small illustrative inputs without fitted data or external files."""
+    n_genes = DEMO_PARAM_RANGES["G"]["value"]
+    control_mu = np.linspace(0.5, 5.0, n_genes)
+    return {
+        "control_mu": control_mu,
+        "pert_mu": control_mu * 1.5,
+        "all_theta": np.full(n_genes, 5.0),
+        "gene_names": np.asarray([f"gene{i}" for i in range(n_genes)]),
+    }
 
 
 def sample_parameters(
