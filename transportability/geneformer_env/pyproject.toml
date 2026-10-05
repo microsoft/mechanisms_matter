@@ -1,7 +1,7 @@
 # Standalone uv project for the Geneformer embedding-extraction stage (AML Stage 1).
 #
 # This is a SEPARATE uv environment from the transportability/STATE project:
-# STATE requires transformers>=5.12, but Geneformer needs an older transformers
+# The main environment uses transformers 5.x, but Geneformer needs older transformers
 # (it imports `SpecialTokensMixin` from the top-level `transformers` namespace,
 # which newer versions removed). The two cannot share one environment, so the
 # frozen-embedding design keeps them decoupled and communicating only via an
@@ -9,11 +9,10 @@
 #
 # Build the isolated env (creates ./.venv):
 #   cd geneformer_env
-#   GIT_LFS_SKIP_SMUDGE=1 uv sync
+#   GIT_LFS_SKIP_SMUDGE=1 uv sync --locked --python 3.11
 #
 # Health check + asset fetch + extraction all run against this env, e.g.:
-#   uv run python check_env.py
-#   uv run python fetch_geneformer_assets.py --model Geneformer-V2-104M --dest ./gf_assets
+#   uv run --locked python fetch_geneformer_assets.py --model Geneformer-V2-104M --dest ./gf_assets
 #
 # NOTE: GIT_LFS_SKIP_SMUDGE=1 installs the Geneformer *code* only; fetch the model
 # + dictionary assets separately via fetch_geneformer_assets.py to avoid the
@@ -25,29 +24,32 @@ version = "0.1.0"
 description = "Isolated Geneformer cell-embedding extraction stage"
 requires-python = ">=3.10,<3.12"
 dependencies = [
-    # Stay on 4.x: transformers v5 merged/removed `SpecialTokensMixin` (which
-    # Geneformer imports from the top-level namespace). Use the newest 4.x
-    # (>=4.53) so all deserialization + ReDoS advisories patchable within 4.x
-    # are cleared. tokenizers is left unpinned (transformers picks the range).
-    "transformers>=4.53,<5",
+    # Geneformer imports SpecialTokensMixin from the top-level namespace.
+    # Keep the 4.x environment isolated; uv.lock pins the resolved version.
+    "transformers==4.57.6",
     # Geneformer code from the HF repo (combine with GIT_LFS_SKIP_SMUDGE=1).
     "geneformer",
     # Runtime deps for tokenization + embedding extraction.
-    "torch",
-    "datasets<3",
+    "torch==2.14.0",
+    "datasets==2.21.0",
     "huggingface_hub",
     "anndata",
-    "scanpy",
+    "scanpy==1.11.5",
     "numpy",
     "pandas",
 ]
 
 [tool.uv.sources]
-geneformer = { git = "https://huggingface.co/ctheodoris/Geneformer" }
+geneformer = { git = "https://huggingface.co/ctheodoris/Geneformer", rev = "04c2b2e84da7c0f385c3f9ad8f3ec24bab6650e5" }
 torch = [
     { index = "torch-cpu", marker = "sys_platform != 'linux'" },
     { index = "torch-cu130", marker = "sys_platform == 'linux'" },
 ]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
 [[tool.uv.index]]
 name = "torch-cpu"

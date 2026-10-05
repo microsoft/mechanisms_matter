@@ -9,6 +9,8 @@
 # Python cache
 __pycache__/
 *.py[cod]
+.venv/
+.tmp/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/

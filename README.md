@@ -91,15 +91,28 @@ The [`run_vendi`](transportability/src/perturbations/analyses/vendi_score/run_ve
 
 ## Prerequisites
 
-- [Python ≥ 3.10](https://www.python.org/)
-- [uv](https://docs.astral.sh/uv/) for dependency management
+- [Python 3.11](https://www.python.org/) is the reference interpreter. The main
+  manifests support Python 3.10–3.12; Geneformer supports 3.10–3.11.
+- [uv 0.11.8](https://docs.astral.sh/uv/) for dependency management
 
 Install the `perturbations` package and its dependencies:
 
 ```bash
 cd transportability
-uv sync
+uv --no-config sync --locked --python 3.11
 ```
+
+The checked-in `uv.lock` pins direct and transitive dependencies. `--locked`
+rejects a stale lock instead of changing the environment. See
+[environment setup](docs/environments.md) for the notebook and Geneformer
+environments, hardware requirements, validation, and Alliance HPC setup. On HPC,
+install dependencies and run Python inside a Slurm allocation, with environments,
+caches, data, and outputs on scratch storage.
+
+The CPA, GEARS, STATE, and scLDM backend wrappers are currently excluded from Git.
+Installing their upstream dependencies does not restore these local wrappers.
+The examples below select included baselines; experiments using the excluded
+wrappers require those implementations to be supplied separately.
 
 ## Example Runs
 
@@ -112,26 +125,29 @@ cd src/perturbations
 Run a small synthetic sweep:
 
 ```bash
-uv run python -m analyses.synthetic_simulations.random_sweep \
+uv run --locked python -m perturbations.analyses.synthetic_simulations.random_sweep \
   --n_trials 2 \
   --dataset causalDGP \
   --split_strategy in-context \
-  --diversity_type A
+  --diversity_type A \
+  --models Control Average linearPCA
 ```
 
 Run real-data experiments:
 
 ```bash
-uv run python -m analyses.real_experiments.run \
+uv run --locked python -m perturbations.analyses.real_experiments.run \
   --dataset_name norman19 \
   --dataset_path data/norman19/norman19_processed.h5ad \
-  --n_trials 10
+  --n_trials 10 \
+  --model linearPCA
 
-uv run python -m analyses.real_experiments.run \
+uv run --locked python -m perturbations.analyses.real_experiments.run \
   --dataset_name replogle22 \
   --dataset_variant RPE1 \
   --split_strategy cross-context \
-  --n_trials 10
+  --n_trials 10 \
+  --model linearPCA
 ```
 
 For Replogle22, run one subset per job with `--dataset_variant RPE1`, `Jurkat`, or `HepG2`.

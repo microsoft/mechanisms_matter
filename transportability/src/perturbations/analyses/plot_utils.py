@@ -59,6 +59,10 @@ EXPECTED_MODEL_ORDER: tuple[str, ...] = (
     "STATE-Geneformer",
     "scLDM",
 )
+SCLDM_OMEGA_VALUES: tuple[int, ...] = (1, 5, 10)
+SCLDM_OMEGA_MODEL_ORDER: tuple[str, ...] = tuple(
+    f"scLDM (ω={omega})" for omega in SCLDM_OMEGA_VALUES
+)
 MODEL_TICK_LABEL_ROTATION = 45.0
 MODEL_TICK_LABEL_ALIGNMENT = "right"
 MODEL_COLORS: dict[str, str] = {
@@ -73,6 +77,9 @@ MODEL_COLORS: dict[str, str] = {
     "STATE": "#b07aa1",
     "STATE-Geneformer": "#7f7f7f",
     "scLDM": "#d4a017",
+    "scLDM (ω=1)": "#8c6d1f",
+    "scLDM (ω=5)": "#d4a017",
+    "scLDM (ω=10)": "#f0c75e",
 }
 COMMON_METRIC_LABELS: dict[str, str] = {
     "pearson": "Pearson",
@@ -187,6 +194,34 @@ def resolve_expected_model_order(
     if not ordered_models:
         raise ValueError("No known models found in the provided results files.")
     return ordered_models
+
+
+def filter_scldm_omega_results(
+    data: pd.DataFrame,
+    *,
+    model_column: str = "model",
+    omega_column: str = "omega",
+) -> pd.DataFrame:
+    """Keep scLDM rows at the requested omega values and label each series."""
+    required_columns = {model_column, omega_column}
+    missing_columns = sorted(required_columns.difference(data.columns))
+    if missing_columns:
+        raise ValueError(f"Results table is missing required columns: {missing_columns}")
+
+    filtered = data.copy()
+    filtered[model_column] = filtered[model_column].astype("string").str.strip()
+    filtered[omega_column] = pd.to_numeric(filtered[omega_column], errors="coerce")
+    filtered = filtered[
+        filtered[model_column].eq("scLDM")
+        & filtered[omega_column].isin(SCLDM_OMEGA_VALUES)
+    ].copy()
+    if filtered.empty:
+        raise ValueError("No scLDM rows with omega in {1, 5, 10} were found.")
+
+    filtered[model_column] = filtered[omega_column].map(
+        {omega: label for omega, label in zip(SCLDM_OMEGA_VALUES, SCLDM_OMEGA_MODEL_ORDER)}
+    )
+    return filtered
 
 
 def get_model_colors(

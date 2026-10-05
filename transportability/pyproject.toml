@@ -3,28 +3,39 @@ name = "perturbations"
 version = "0.1.0"
 description = "Cellular perturbation modeling, evaluation, and analysis"
 license = "LicenseRef-Proprietary"
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.10,<3.13"
 authors = []
 dependencies = [
 	"anndata",
-	"ema-pytorch",
-	"fair-esm",
-	"geomloss",
-	"numpy",
+	"ema-pytorch>=0.7.9",
+	"fair-esm>=2.0.0",
+	"geomloss>=0.2.6",
+	"h5py",
+	"igraph>=0.11.8",
+	"leidenalg>=0.10.2",
+	"matplotlib",
+	"networkx==3.3",
+	"numpy==2.2.6",
 	"omegaconf",
-	"pandas",
-	"peft",
+	"pandas==2.2.3",
+	"peft>=0.18.1",
 	"polars",
-	"pot",
+	"pot>=0.9.7",
 	"pydeseq2",
 	"requests",
-	"scanpy>=1.10",
-	"scikit-learn",
-	"scipy",
-	"scvi-tools",
-	"torch",
-	"torch-geometric",
-	"transformers",
+	"scanpy==1.11.5",
+	"scikit-learn==1.6.1",
+	"scikit-misc>=0.5.2",
+	"scipy==1.15.2",
+	"scvi-tools==1.3.3",
+	"seaborn>=0.13.2",
+	"statsmodels",
+	"torch==2.14.0",
+	"torch-geometric>=2.6.1,<3",
+	"torchdiffeq>=0.2.5",
+	"tqdm==4.67.3",
+	"transformers==5.16.1",
+	"umap-learn",
 	"wandb",
 ]
 
@@ -38,8 +49,8 @@ dev = [
 ]
 
 [[tool.uv.index]]
-name = "microsoft-pypi"
-url = "https://packagefeedproxy.microsoft.io/pypi/simple/"
+name = "pypi"
+url = "https://pypi.org/simple"
 default = true
 
 [project.urls]

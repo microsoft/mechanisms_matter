@@ -17,19 +17,19 @@ if __package__ in {None, ""}:
 
 from ..plot_utils import (
     COMMON_METRIC_LABELS,
-    EXPECTED_MODEL_ORDER,
     MODEL_COLORS,
+    SCLDM_OMEGA_MODEL_ORDER,
     apply_paper_plot_style,
     coerce_numeric,
+    filter_scldm_omega_results,
     metric_axis_label,
-    resolve_expected_model_order,
     transform_metric_values,
     with_vendi_ratio,
 )
 
 apply_paper_plot_style()
 
-CD4_MODEL_ORDER: tuple[str, ...] = EXPECTED_MODEL_ORDER
+CD4_MODEL_ORDER: tuple[str, ...] = SCLDM_OMEGA_MODEL_ORDER
 
 CONTEXT_ORDER: tuple[str, ...] = (
     "D2_Rest",
@@ -169,6 +169,8 @@ def prepare_results_data(data: pd.DataFrame) -> pd.DataFrame:
     prepared = with_vendi_ratio(prepared, ratio_column=VENDI_RATIO_COLUMN)
     if VENDI_RATIO_COLUMN not in prepared.columns:
         prepared[VENDI_RATIO_COLUMN] = np.nan
+    prepared = filter_scldm_omega_results(prepared)
+    print(f"Kept scLDM omega rows: {len(prepared)}")
     return prepared
 
 
@@ -423,9 +425,7 @@ def main() -> None:
 
     in_context_data = prepare_results_data(pd.read_csv(in_context_path))
     cross_context_data = prepare_results_data(pd.read_csv(cross_context_path))
-    model_order = resolve_expected_model_order(
-        in_context_data, cross_context_data, expected_order=CD4_MODEL_ORDER
-    )
+    model_order = list(CD4_MODEL_ORDER)
     print(f"Models: {model_order}")
 
     output_dir = (

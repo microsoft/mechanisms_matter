@@ -201,6 +201,15 @@ def prepare_results_data(data: pd.DataFrame) -> pd.DataFrame:
     prepared = with_vendi_ratio(prepared, ratio_column=VENDI_RATIO_COLUMN)
     if VENDI_RATIO_COLUMN not in prepared.columns:
         prepared[VENDI_RATIO_COLUMN] = np.nan
+    scldm = prepared["model"].eq("scLDM")
+    if scldm.any():
+        if "omega" not in prepared.columns:
+            raise ValueError("The omega column is required to select scLDM at omega=5.")
+        omega = pd.to_numeric(prepared["omega"], errors="coerce")
+        if not (scldm & omega.eq(5)).any():
+            raise ValueError("No successful scLDM rows at omega=5 were found.")
+        prepared = prepared.loc[~scldm | omega.eq(5)].copy()
+    print(f"Kept all models with scLDM omega=5: {len(prepared)} rows")
     return prepared
 
 
@@ -454,11 +463,7 @@ def main() -> None:
         for split_key, change_paths in split_change_paths.items()
     }
     model_order = resolve_expected_model_order(
-        *[
-            data
-            for change_results in split_change_results.values()
-            for data in change_results.values()
-        ],
+        *[data for results in split_change_results.values() for data in results.values()],
         expected_order=EXPECTED_MODEL_ORDER,
     )
     print(f"Models available across inputs: {model_order}")
