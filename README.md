@@ -107,10 +107,8 @@ rejects a stale lock instead of changing the environment. See
 [environment setup](docs/environments.md) for the notebook and Geneformer
 environments and validation.
 
-The CPA, GEARS, STATE, and scLDM backend wrappers are currently excluded from Git.
-Installing their upstream dependencies does not restore these local wrappers.
-The examples below select included baselines; experiments using the excluded
-wrappers require those implementations to be supplied separately.
+CPA, GEARS, STATE, and scLDM require additional model implementations that are
+not included in this repository.
 
 ## Example Runs
 
