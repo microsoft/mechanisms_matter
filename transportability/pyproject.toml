@@ -2,7 +2,7 @@
 name = "perturbations"
 version = "0.1.0"
 description = "Cellular perturbation modeling, evaluation, and analysis"
-license = "LicenseRef-Proprietary"
+license = "MIT"
 requires-python = ">=3.10,<3.13"
 authors = []
 dependencies = [
