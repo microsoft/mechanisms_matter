@@ -212,14 +212,16 @@ def filter_scldm_omega_results(
     filtered[model_column] = filtered[model_column].astype("string").str.strip()
     filtered[omega_column] = pd.to_numeric(filtered[omega_column], errors="coerce")
     filtered = filtered[
-        filtered[model_column].eq("scLDM")
-        & filtered[omega_column].isin(SCLDM_OMEGA_VALUES)
+        filtered[model_column].eq("scLDM") & filtered[omega_column].isin(SCLDM_OMEGA_VALUES)
     ].copy()
     if filtered.empty:
         raise ValueError("No scLDM rows with omega in {1, 5, 10} were found.")
 
     filtered[model_column] = filtered[omega_column].map(
-        {omega: label for omega, label in zip(SCLDM_OMEGA_VALUES, SCLDM_OMEGA_MODEL_ORDER)}
+        {
+            omega: label
+            for omega, label in zip(SCLDM_OMEGA_VALUES, SCLDM_OMEGA_MODEL_ORDER, strict=True)
+        }
     )
     return filtered
 

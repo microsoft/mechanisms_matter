@@ -36,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Check manifest and lock agreement
-        run: uv --no-config lock --project "${{ matrix.project }}" --check --offline
+        run: uv --no-config sync --project "${{ matrix.project }}" --locked --dry-run
 
   ruff:
     name: Ruff
