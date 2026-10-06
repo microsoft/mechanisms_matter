@@ -18,7 +18,7 @@ To cite the paper:
 }
 ```
 
-- **Keywords**: Cellular Perturbation, Transportability, Causal Inference
+- **Keywords**: Cellular perturbation effect; transportability; Perturb-seq; causal mechanisms; single-cell genomics
 - **License**: MIT
 
 ## Transportability Framework
@@ -64,14 +64,16 @@ The [`ContextSplitter`](transportability/src/perturbations/analyses/context.py) 
 
 | Model | Source |
 |-------|--------|
-| Control mean | Included |
-| Pert. mean | Included |
+| Control | Included |
+| Average | Included |
+| Context-Average | Included |
 | linearPCA | Included |
+| Context-linearPCA | Included |
 | scVI | Included |
 | CPA | [CPA](https://github.com/theislab/cpa) |
 | GEARS | [GEARS](https://github.com/snap-stanford/GEARS) |
 | STATE | [STATE](https://github.com/ArcInstitute/state)  |
-| STATE (Geneformer) | [STATE](https://github.com/ArcInstitute/state) + [Geneformer](https://huggingface.co/ctheodoris/Geneformer) |
+| STATE-Geneformer | [STATE](https://github.com/ArcInstitute/state) + [Geneformer](https://huggingface.co/ctheodoris/Geneformer) |
 | scLDM | [scLDM](https://github.com/czi-ai/scldm) |
 
 STATE (Geneformer) uses [Geneformer](https://huggingface.co/ctheodoris/Geneformer) cell embeddings as the basal cell state. See [`geneformer_env/`](transportability/geneformer_env/) for extraction setup.
@@ -102,27 +104,25 @@ cd transportability
 uv --no-config sync --locked --python 3.11
 ```
 
-The checked-in `uv.lock` pins direct and transitive dependencies. `--locked`
-rejects a stale lock instead of changing the environment. See
-[environment setup](docs/environments.md) for the notebook and Geneformer
-environments, hardware requirements, validation, and Alliance HPC setup. On HPC,
-install dependencies and run Python inside a Slurm allocation, with environments,
-caches, data, and outputs on scratch storage.
+Each environment has an adjacent `uv.lock` that pins its direct and transitive
+dependencies. `--locked` rejects a stale lock instead of changing the
+environment. See
+[environment setup](docs/environments.md) for the main package, the isolated
+Geneformer environment, and validation instructions.
 
-The CPA, GEARS, STATE, and scLDM backend wrappers are currently excluded from Git.
-Installing their upstream dependencies does not restore these local wrappers.
-The examples below select included baselines; experiments using the excluded
-wrappers require those implementations to be supplied separately.
+CPA, GEARS, STATE, and scLDM require additional model implementations that are
+not included in this repository.
 
 ## Example Runs
 
-The analysis modules use paths relative to the package source directory. After setup, run the examples from that directory:
+The commands below assume that your current directory is
+`transportability/src/perturbations/`. After setup, change to that directory:
 
 ```bash
 cd src/perturbations
 ```
 
-Run a self-contained synthetic quickstart on CPU:
+Run a self-contained synthetic quickstart:
 
 ```bash
 uv --no-config run --locked python -m perturbations.analyses.synthetic_simulations.random_sweep \
@@ -137,21 +137,18 @@ uv --no-config run --locked python -m perturbations.analyses.synthetic_simulatio
 
 The demo generates illustrative parameter arrays in memory and uses 64 genes,
 eight perturbations, 64 control cells, and 32 cells per perturbation in each
-context. It requires no datasets, fitted CSVs, model downloads, or GPU. It runs
+context. It requires no datasets, fitted CSVs, or model downloads. It runs
 the simulator, context splitting, baseline predictions, and evaluation, and writes
 a `results_*.csv` under `results/synthetic_quickstart/`. Successful runs report
 `Success: 2/2 trials`, `Failed: 0/2 trials`, and `status=success` in the CSV.
-Use `--dataset directDGP` to exercise the direct simulator, or
-`--split_strategy cross-context` with `causalDGP` to exercise transportability.
-On Alliance HPC, run inside Slurm and set `--output_dir` to a directory on
-`$SCRATCH`. To run outside the checkout, use the installed environment's
+Use `--dataset directDGP` to run the direct simulator, or use
+`--split_strategy cross-context` with `causalDGP` to evaluate transportability.
+To run outside the checkout, use the installed environment's
 `python -m perturbations.analyses.synthetic_simulations.random_sweep`, or pass
 `--project <repository-path>/transportability` to `uv run`.
 
 For paper-scale sweeps, generate fitted inputs from Norman19 first. From
-`transportability/src/perturbations/`, run these steps. On Alliance HPC, use a
-compute allocation and a working directory on `$SCRATCH` with the same `data/`
-and `results/` layout. Outside the checkout, also pass
+`transportability/src/perturbations/`, run these steps. Outside the checkout, pass
 `--project <repository-path>/transportability` to both commands:
 
 ```bash
@@ -185,7 +182,8 @@ uv run --locked python -m perturbations.analyses.real_experiments.run \
   --model linearPCA
 ```
 
-For Replogle22, run one subset per job with `--dataset_variant RPE1`, `Jurkat`, or `HepG2`.
+For Replogle22/Nadig25, run each dataset variant separately with
+`--dataset_variant RPE1`, `Jurkat`, or `HepG2`.
 
 ## Repository Layout
 
