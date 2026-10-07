@@ -1,0 +1,446 @@
+--- a/transportability/src/perturbations/models/state_gene/state_gene.py
++++ b/transportability/src/perturbations/models/state_gene/state_gene.py
+@@ -1,7 +1,12 @@
+ # Adapted from https://github.com/ArcInstitute/state/tree/4fbfbecd1e6f0e2d151e06fdbf08549d9fbf3ecf/src/state
+ """StateTransitionPerturbationModel: a set-based transformer model for perturbation prediction using optimal transport."""
+ 
++import hashlib
+ import logging
++import os
++import random
++import time
++from pathlib import Path
+ from typing import Any, cast
+ 
+ import anndata
+@@ -39,6 +44,102 @@
+     torch.cuda.manual_seed_all(_seed)
+ 
+ 
++def _array_digest(values: Any) -> str:
++    """Hash array contents without copying dense expression matrices to bytes."""
++    digest = hashlib.sha256()
++    if issparse(values):
++        matrix = values.tocsr(copy=False)
++        digest.update(str(matrix.shape).encode())
++        arrays = (matrix.data, matrix.indices, matrix.indptr)
++    else:
++        arrays = (np.asarray(values),)
++    for array in arrays:
++        if array.dtype.kind == "O":
++            array = array.astype(str)
++        digest.update(str(array.shape).encode())
++        digest.update(str(array.dtype).encode())
++        if array.size:
++            digest.update(memoryview(np.ascontiguousarray(array)).cast("B"))
++    return digest.hexdigest()
++
++
++def _split_provenance(
++    adata: anndata.AnnData,
++    perturbation_column: str,
++    context_key: str | None,
++    basal_embedding_key: str | None,
++) -> dict[str, Any]:
++    """Identify the exact training, validation, or prediction data in a checkpoint."""
++    provenance = {
++        "shape": list(adata.shape),
++        "obs_names": _array_digest(adata.obs_names.to_numpy()),
++        "var_names": _array_digest(adata.var_names.to_numpy()),
++        "perturbations": _array_digest(adata.obs[perturbation_column].to_numpy()),
++        "expression": _array_digest(adata.X),
++    }
++    if context_key is not None:
++        provenance["contexts"] = _array_digest(adata.obs[context_key].to_numpy())
++    if basal_embedding_key is not None:
++        provenance["basal_embedding"] = _array_digest(adata.obsm[basal_embedding_key])
++    return provenance
++
++
++class _StateRunCheckpointState(pl.Callback):
++    """Preserve run identity and sampling RNGs alongside Lightning's training state."""
++
++    def __init__(self, provenance: dict[str, Any]):
++        self.provenance = provenance
++        self.training_complete = False
++        self._resume_rng: dict[str, Any] | None = None
++        self._epoch_start = 0.0
++
++    def validate_checkpoint(self, checkpoint: dict[str, Any]) -> None:
++        if checkpoint.get("state_run_provenance") != self.provenance:
++            raise ValueError(
++                "STATE checkpoint provenance does not match this run's data, "
++                "embeddings, seed, or model settings. Use a separate checkpoint directory."
++            )
++
++    def on_save_checkpoint(
++        self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: dict[str, Any]
++    ) -> None:
++        checkpoint["state_run_provenance"] = self.provenance
++        checkpoint["state_training_complete"] = self.training_complete
++        checkpoint["state_rng"] = {
++            "python": random.getstate(),
++            "numpy": np.random.get_state(),
++            "torch": torch.get_rng_state(),
++            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
++        }
++
++    def on_load_checkpoint(
++        self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: dict[str, Any]
++    ) -> None:
++        self.validate_checkpoint(checkpoint)
++        self._resume_rng = checkpoint.get("state_rng")
++
++    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
++        if self._resume_rng is not None:
++            random.setstate(self._resume_rng["python"])
++            np.random.set_state(self._resume_rng["numpy"])
++            torch.set_rng_state(self._resume_rng["torch"].cpu())
++            if torch.cuda.is_available() and self._resume_rng["cuda"] is not None:
++                torch.cuda.set_rng_state_all([state.cpu() for state in self._resume_rng["cuda"]])
++            self._resume_rng = None
++
++    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
++        self._epoch_start = time.perf_counter()
++
++    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
++        if trainer.current_epoch < 3 or (trainer.current_epoch + 1) % 10 == 0:
++            print(
++                f"[STATE] epoch={trainer.current_epoch + 1} "
++                f"epoch_seconds={time.perf_counter() - self._epoch_start:.2f} "
++                f"global_step={trainer.global_step}",
++                flush=True,
++            )
++
++
+ class CombinedLoss(nn.Module):
+     """Combined Sinkhorn + Energy loss."""
+ 
+@@ -377,6 +478,16 @@
+             )
+         print(self)
+ 
++    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
++        """Keep direct gene-output checkpoints free of an auxiliary decoder."""
++        if (
++            self.gene_decoder is None
++            and self.decoder_cfg is None
++            and checkpoint.get("hyper_parameters", {}).get("decoder_cfg") is None
++        ):
++            return
++        super().on_load_checkpoint(checkpoint)
++
+     def _build_networks(self, lora_cfg: dict[str, Any] | None = None) -> None:
+         """Here we instantiate the actual GPT2-based model."""
+         self.pert_encoder = build_mlp(
+@@ -1094,6 +1205,9 @@
+     dataloader_num_workers: int | None = None,
+     dataloader_pin_memory: bool | None = None,
+     basal_embedding_key: str | None = None,
++    seed: int | None = None,
++    checkpoint_dir: str | None = None,
++    resume_from_checkpoint: str | None = None,
+ ) -> dict[str, Any]:
+     """
+     Run the full State Transition model training and evaluation pipeline.
+@@ -1121,20 +1235,37 @@
+         regularization: L1 regularization weight on prediction delta.
+         epochs: Number of training epochs.
+         batch_size: Number of perturbation sets per batch.
+-        dataloader_num_workers: Number of DataLoader worker processes. Defaults to a
+-            small nonzero value, or ``STATE_DATALOADER_NUM_WORKERS`` when set.
++        dataloader_num_workers: Number of DataLoader worker processes. Defaults to
++            zero, or ``STATE_DATALOADER_NUM_WORKERS`` when set.
+         dataloader_pin_memory: Whether to pin DataLoader host memory. Defaults to CUDA availability.
+         basal_embedding_key: Optional key in ``.obsm`` holding a precomputed basal
+             cell embedding (e.g. a Geneformer/scGPT encoder output). When set, the
+             model consumes that embedding as the basal state (``input_dim`` = its
+             width) and still predicts in gene space (``output_dim = gene_dim = n_vars``).
++        seed: Seed Python, NumPy, Torch, and DataLoader workers for this trial.
++        checkpoint_dir: Stable checkpoint directory; defaults to the logger's
++            checkpoint directory. Full optimizer and callback states are saved.
++        resume_from_checkpoint: Explicit checkpoint path, or ``"last"`` to resume
++            ``checkpoint_dir/last.ckpt`` when it exists. Incompatible data,
++            embeddings, seeds, or model settings are rejected.
+ 
+     Returns:
+         Dict with full test-aligned keys: preds, truths, ctrl, pert_names.
+     """
++    setup_start = time.perf_counter()
++    if seed is not None:
++        pl.seed_everything(seed, workers=True)
++    if dataloader_num_workers is None:
++        dataloader_num_workers = int(os.environ.get("STATE_DATALOADER_NUM_WORKERS", "0"))
++    if dataloader_num_workers < 0:
++        raise ValueError("dataloader_num_workers must be non-negative.")
++    if dataloader_pin_memory is None:
++        dataloader_pin_memory = torch.cuda.is_available()
+     print(f"Using context_key='{context_key}' for batch token classes.")
+     if transformer_backbone_kwargs is None:
+         transformer_backbone_kwargs = {"n_layer": 2, "n_head": 4, "n_embd": hidden_dim}
++    else:
++        transformer_backbone_kwargs = dict(transformer_backbone_kwargs)
+ 
+     train_adata = materialize_adata(train_adata, expression_layer=expression_layer)
+     valid_adata = materialize_adata(valid_adata, expression_layer=expression_layer)
+@@ -1143,12 +1274,23 @@
+     # Basal input dimension: the width of the precomputed embedding when provided,
+     # otherwise the number of genes. Output stays in gene space regardless.
+     if basal_embedding_key is not None:
+-        if basal_embedding_key not in train_adata.obsm:
+-            raise KeyError(
+-                f"basal_embedding_key='{basal_embedding_key}' not found in train_adata.obsm "
+-                f"(available: {list(train_adata.obsm.keys())})."
+-            )
+-        input_dim = int(np.asarray(train_adata.obsm[basal_embedding_key]).shape[1])
++        embedding_widths = []
++        for split_name, split in (("train", train_adata), ("valid", valid_adata), ("test", test_adata)):
++            if basal_embedding_key not in split.obsm:
++                raise KeyError(
++                    f"basal_embedding_key='{basal_embedding_key}' not found in "
++                    f"{split_name}_adata.obsm (available: {list(split.obsm.keys())})."
++                )
++            embedding = split.obsm[basal_embedding_key]
++            if len(embedding.shape) != 2 or embedding.shape[0] != split.n_obs:
++                raise ValueError(f"Invalid basal embedding shape in the {split_name} split.")
++            embedding_values = embedding.data if issparse(embedding) else np.asarray(embedding)
++            if not np.isfinite(embedding_values).all():
++                raise ValueError(f"Basal embedding contains non-finite values in {split_name}.")
++            embedding_widths.append(int(embedding.shape[1]))
++        if len(set(embedding_widths)) != 1 or embedding_widths[0] < 1:
++            raise ValueError(f"Basal embedding widths differ across splits: {embedding_widths}")
++        input_dim = embedding_widths[0]
+         print(
+             f"Using basal_embedding_key='{basal_embedding_key}' as basal state "
+             f"(input_dim={input_dim}); predicting in gene space (output_dim={train_adata.n_vars})."
+@@ -1202,6 +1344,63 @@
+     else:
+         context_to_idx = {}
+ 
++    run_provenance = {
++        "format_version": 1,
++        "settings": {
++            "seed": seed,
++            "perturbation_column": perturbation_column,
++            "control_label": control_label,
++            "context_key": context_key,
++            "basal_embedding_key": basal_embedding_key,
++            "input_dim": input_dim,
++            "hidden_dim": hidden_dim,
++            "n_encoder_layers": n_encoder_layers,
++            "n_decoder_layers": n_decoder_layers,
++            "transformer_backbone_key": transformer_backbone_key,
++            "transformer_backbone_kwargs": dict(transformer_backbone_kwargs),
++            "batch_dim": batch_dim,
++            "use_batch_token": use_batch_token,
++            "mmd_num_chunks": mmd_num_chunks,
++            "randomize_mmd_chunks": randomize_mmd_chunks,
++            "regularization": regularization,
++            "batch_size": batch_size,
++            "epochs": epochs,
++            "dataloader_num_workers": dataloader_num_workers,
++            "cell_sentence_len": cell_sentence_len,
++            "pert_categories": pert_categories,
++            "context_to_idx": context_to_idx,
++        },
++        "splits": {
++            name: _split_provenance(split, perturbation_column, context_key, basal_embedding_key)
++            for name, split in (("train", train_adata), ("valid", valid_adata), ("test", test_adata))
++        },
++    }
++    run_checkpoint_state = _StateRunCheckpointState(run_provenance)
++    tensorboard_logger = TensorBoardLogger(
++        save_dir=model_dir,
++        name=dataset_name,
++        version=0 if checkpoint_dir is not None else None,
++    )
++    resolved_checkpoint_dir = (
++        Path(checkpoint_dir)
++        if checkpoint_dir is not None
++        else Path(tensorboard_logger.log_dir) / "checkpoints"
++    )
++    resume_path: Path | None = None
++    if resume_from_checkpoint == "last":
++        candidate = resolved_checkpoint_dir / "last.ckpt"
++        if candidate.is_file():
++            resume_path = candidate
++    elif resume_from_checkpoint is not None:
++        resume_path = Path(resume_from_checkpoint)
++        if not resume_path.is_file():
++            raise FileNotFoundError(f"STATE checkpoint does not exist: {resume_path}")
++    resumed_checkpoint = None
++    if resume_path is not None:
++        resumed_checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
++        run_checkpoint_state.validate_checkpoint(resumed_checkpoint)
++        print(f"[STATE] Resuming checkpoint: {resume_path}", flush=True)
++
+     model = StateTransitionPerturbationModel(
+         hidden_dim=hidden_dim,
+         gene_dim=train_adata.n_vars,
+@@ -1225,13 +1424,22 @@
+         regularization=regularization,
+     )
+ 
++    checkpoint_callback = ModelCheckpoint(
++        dirpath=resolved_checkpoint_dir,
++        monitor="val_loss",
++        save_top_k=1,
++        save_last=True,
++        mode="min",
++    )
+     trainer = pl.Trainer(
+         max_epochs=epochs,
+         accelerator="auto",
+         devices="auto",
+-        logger=TensorBoardLogger(save_dir=model_dir, name=dataset_name),
++        logger=tensorboard_logger,
++        num_sanity_val_steps=0 if resume_path is not None else 2,
+         callbacks=[
+-            ModelCheckpoint(monitor="val_loss", save_top_k=1, mode="min"),
++            run_checkpoint_state,
++            checkpoint_callback,
+             EarlyStopping(monitor="val_loss", patience=10, mode="min"),
+             LearningRateMonitor(logging_interval="epoch"),
+         ],
+@@ -1247,6 +1455,9 @@
+         shuffle=True,
+         context_key=context_key,
+         basal_embedding_key=basal_embedding_key,
++        context_to_idx=context_to_idx,
++        num_workers=dataloader_num_workers,
++        pin_memory=dataloader_pin_memory,
+     )
+     valid_dataloader = create_perturbation_dataloader(
+         adata=valid_adata,
+@@ -1258,8 +1469,44 @@
+         shuffle=False,
+         context_key=context_key,
+         basal_embedding_key=basal_embedding_key,
++        context_to_idx=context_to_idx,
++        num_workers=dataloader_num_workers,
++        pin_memory=dataloader_pin_memory,
++    )
++    print(
++        f"[STATE] setup_seconds={time.perf_counter() - setup_start:.2f} "
++        f"train_batches={len(train_dataloader)} validation_batches={len(valid_dataloader)} "
++        f"workers={dataloader_num_workers}",
++        flush=True,
+     )
+-    trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=valid_dataloader)
++    fit_start = time.perf_counter()
++    if resumed_checkpoint is not None and resumed_checkpoint.get("state_training_complete", False):
++        model.load_state_dict(resumed_checkpoint["state_dict"])
++        epochs_completed = int(resumed_checkpoint["epoch"])
++        global_step = int(resumed_checkpoint["global_step"])
++        print("[STATE] Training is complete in this checkpoint; generating predictions.", flush=True)
++    else:
++        del resumed_checkpoint
++        trainer.fit(
++            model,
++            train_dataloaders=train_dataloader,
++            val_dataloaders=valid_dataloader,
++            ckpt_path=str(resume_path) if resume_path is not None else None,
++            weights_only=False,
++        )
++        epochs_completed = int(trainer.current_epoch)
++        global_step = int(trainer.global_step)
++        run_checkpoint_state.training_complete = True
++        trainer.save_checkpoint(resolved_checkpoint_dir / "last.ckpt")
++    fit_seconds = time.perf_counter() - fit_start
++    # Lightning returns the module to CPU during teardown; prediction still
++    # needs the accelerator allocated for this trial.
++    model.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
++    # Prediction control sampling should be reproducible even when training was
++    # resumed or already finished before an interrupted evaluation was retried.
++    if seed is not None:
++        np.random.seed(seed)
++    prediction_start = time.perf_counter()
+ 
+     preds_np, truths_np, pert_names = model.per_cell_prediction(
+         test_adata=test_adata,
+@@ -1271,7 +1518,25 @@
+         basal_embedding_key=basal_embedding_key,
+     )
+ 
+-    return {"preds": preds_np, "truths": truths_np, "pert_names": pert_names}
++    prediction_seconds = time.perf_counter() - prediction_start
++    print(
++        f"[STATE] fit_seconds={fit_seconds:.2f} prediction_seconds={prediction_seconds:.2f} "
++        f"epochs_completed={epochs_completed} global_step={global_step}",
++        flush=True,
++    )
++    return {
++        "preds": preds_np,
++        "truths": truths_np,
++        "pert_names": pert_names,
++        "basal_embedding_key": basal_embedding_key,
++        "input_dim": input_dim,
++        "output_dim": int(train_adata.n_vars),
++        "checkpoint_path": str(resolved_checkpoint_dir / "last.ckpt"),
++        "epochs_completed": epochs_completed,
++        "global_step": global_step,
++        "fit_seconds": fit_seconds,
++        "prediction_seconds": prediction_seconds,
++    }
+ 
+ 
+ if __name__ == "__main__":
+--- a/transportability/src/perturbations/models/state_gene/loader.py
++++ b/transportability/src/perturbations/models/state_gene/loader.py
+@@ -647,6 +647,7 @@
+         pert_categories: list[str],
+         context_key: str | None = None,
+         basal_embedding_key: str | None = None,
++        context_to_idx: dict[str, int] | None = None,
+     ) -> None:
+         """Initialize dataset by extracting control and perturbed expression matrices."""
+         # When ``basal_embedding_key`` is provided, the basal (control) state is
+@@ -663,7 +664,14 @@
+         # Build context (cell type / cell line) integer mapping
+         if context_key is not None and context_key in adata.obs.columns:
+             all_contexts = sorted(adata.obs[context_key].unique().tolist())
+-            self.context_to_idx: dict[str, int] = {c: i for i, c in enumerate(all_contexts)}
++            self.context_to_idx: dict[str, int] = (
++                {c: i for i, c in enumerate(all_contexts)}
++                if context_to_idx is None
++                else dict(context_to_idx)
++            )
++            missing_contexts = set(all_contexts).difference(self.context_to_idx)
++            if missing_contexts:
++                raise ValueError(f"Context mapping is missing labels: {sorted(missing_contexts)}")
+             self.context_labels: np.ndarray | None = np.asarray(adata.obs[context_key])
+         else:
+             self.context_to_idx = {}
+@@ -823,6 +831,8 @@
+     num_workers: int = 0,
+     context_key: str | None = None,
+     basal_embedding_key: str | None = None,
++    context_to_idx: dict[str, int] | None = None,
++    pin_memory: bool = False,
+ ) -> DataLoader[dict[str, torch.Tensor | list[str]]]:
+     """
+     Build a DataLoader yielding dict batches for StateTransitionPerturbationModel.
+@@ -841,6 +851,9 @@
+             basal cell embedding (e.g. a foundation-model encoder output). When
+             set, the basal state is read from that embedding while the perturbed
+             target stays gene expression from .X.
++        context_to_idx: Shared context class IDs across training, validation,
++            and prediction, including contexts absent from an individual split.
++        pin_memory: Pin host tensors for transfer to a CUDA device.
+ 
+     Returns:
+         DataLoader yielding dicts with keys: ctrl_cell_emb, pert_cell_emb, pert_emb, batch.
+@@ -853,6 +866,7 @@
+         pert_categories=pert_categories,
+         context_key=context_key,
+         basal_embedding_key=basal_embedding_key,
++        context_to_idx=context_to_idx,
+     )
+     return DataLoader(
+         dataset,
+@@ -860,4 +874,5 @@
+         shuffle=shuffle,
+         collate_fn=_perturbation_collate,
+         num_workers=num_workers,
++        pin_memory=pin_memory,
+     )

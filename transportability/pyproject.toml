@@ -1,0 +1,206 @@
+[project]
+name = "perturbations"
+version = "0.1.0"
+description = "Cellular perturbation modeling, evaluation, and analysis"
+license = "MIT"
+requires-python = ">=3.10,<3.13"
+authors = []
+dependencies = [
+	"anndata",
+	"ema-pytorch>=0.7.9",
+	"fair-esm>=2.0.0",
+	"geomloss>=0.2.6",
+	"h5py",
+	"igraph>=0.11.8",
+	"leidenalg>=0.10.2",
+	"matplotlib",
+	"networkx==3.3",
+	"numpy==2.2.6",
+	"omegaconf",
+	"pandas==2.2.3",
+	"peft>=0.18.1",
+	"polars",
+	"pot>=0.9.7",
+	"pydeseq2",
+	"requests",
+	"scanpy==1.11.5",
+	"scikit-learn==1.6.1",
+	"scikit-misc>=0.5.2",
+	"scipy==1.15.2",
+	"scvi-tools==1.3.3",
+	"seaborn>=0.13.2",
+	"statsmodels",
+	"torch==2.14.0",
+	"torch-geometric>=2.6.1,<3",
+	"torchdiffeq>=0.2.5",
+	"tqdm==4.67.3",
+	"transformers==5.16.1",
+	"umap-learn",
+	"wandb",
+]
+
+[dependency-groups]
+dev = [
+	"coverage",
+	"pyright",
+	"pytest",
+	"pytest-cov",
+	"ruff",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[project.urls]
+repository = "https://github.com/microsoft/mechanisms_matter"
+
+[project.scripts]
+
+# ==================================
+# REPO-STANDARD BOILERPLATE BELOW HERE
+# ==================================
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/perturbations"]
+
+[tool.rats-devtools]
+enabled = true
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["src", "test"]
+exclude = ["**/__pycache__"]
+
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+
+deprecateTypingAliases = true
+reportPropertyTypeMismatch = true
+reportUnusedImport = true
+reportUnusedClass = true
+reportUnusedVariable = true
+reportDuplicateImport = true
+reportUntypedFunctionDecorator = true
+reportUntypedClassDecorator = true
+reportUntypedBaseClass = true
+reportUntypedNamedTuple = true
+reportConstantRedefinition = true
+reportDeprecated = true
+reportInconsistentConstructor = true
+reportUnknownParameterType = true
+reportMissingParameterType = true
+reportMissingTypeArgument = true
+reportUnnecessaryCast = true
+reportUnnecessaryContains = true
+reportImplicitStringConcatenation = true
+reportInvalidStubStatement = true
+reportIncompleteStub = true
+reportUnnecessaryTypeIgnoreComment = true
+reportMatchNotExhaustive = true
+
+reportMissingTypeStubs = false
+reportImportCycles = true
+reportUnusedFunction = false
+reportMissingSuperCall = false
+reportPrivateUsage = true
+reportUninitializedInstanceVariable = true
+reportUnknownArgumentType = true
+reportUnknownLambdaType = true
+reportUnknownVariableType = true
+reportUnknownMemberType = true
+reportCallInDefaultInitializer = true
+reportUnnecessaryIsInstance = true
+reportUnnecessaryComparison = true
+reportUnusedCallResult = false
+reportUnusedExpression = true
+reportImplicitOverride = false
+reportIncompatibleVariableOverride = true
+reportIncompatibleMethodOverride = true
+
+[tool.ruff]
+cache-dir = ".tmp/.ruff_cache"
+include = ["src/**/*.py", "test/**/*.py", "pyproject.toml"]
+exclude = ["src/resources/*"]
+line-length = 100
+indent-width = 4
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+	"B",    # Bugbear
+	"D",    # Docstring
+	"E",    # Pycodestyle
+	"F",    # Pyflakes
+	"I",    # Import
+	"Q",    # Quotes
+	"W",    # PEP8 warnings
+	"NPY",  # Numpy
+	"PD",   # Pydocstyle
+	"PTH",  # Path
+	"RUF",  # Ruff
+	"UP",   # Unittest
+	"D213", # D213: Multi-line docstring summary should start at the second line
+]
+ignore = [
+	"E501",  # E501: Line too long ({width} > {limit})
+	"D212",  # D212: Multi-line docstring summary should start at the second line
+	"PD011", # PD011: Use `.to_numpy()` instead of `.values`
+]
+
+fixable = ["ALL"]
+unfixable = []
+
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"test/*" = [
+	"F401", # Unused import
+	"D100", # Missing docstring in public module
+	"D101", # Missing docstring in public class
+	"D102", # Missing docstring in public method
+	"D103", # Missing docstring in public function
+	"D104", # Missing docstring in public package
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["perturbations"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = false
+
+[tool.coverage.run]
+data_file = ".tmp/.coverage"
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.xml]
+output = ".tmp/report.coverage.xml"
+
+[tool.pytest.ini_options]
+cache_dir = ".tmp/.pytest_cache"
+testpaths = ["test"]
+addopts = """
+	--cov=src/perturbations --cov=test
+	--cov-report=term
+	--cov-report=xml
+	--junit-xml .tmp/report.pytest-junit.xml
+	--capture=no
+	--cov-branch
+	--cache-clear
+"""
