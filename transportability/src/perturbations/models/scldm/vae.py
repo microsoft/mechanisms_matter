@@ -1,0 +1,146 @@
+"""Simple VAE model for single-cell data using transformer-based encoder and decoder."""
+
+import torch
+import torch.nn as nn
+from scvi.distributions import NegativeBinomial as NegativeBinomialSCVI
+from torch.distributions import Distribution, Normal
+
+from .layers import InputTransformerVAE
+from .nnets import Decoder, DecoderScvi, Encoder, EncoderScvi
+from .stochastic_layers import (
+    GaussianLinearLayer,
+    NegativeBinomialLinearLayer,
+    NegativeBinomialTransformerLayer,
+)
+
+
+class TransformerVAE(nn.Module):
+    """VAE model that encodes single-cell data using a transformer-based encoder and decodes it using a transformer-based decoder."""
+
+    def __init__(
+        self,
+        encoder: Encoder,
+        decoder: Decoder,
+        decoder_head: NegativeBinomialTransformerLayer,
+        input_layer: InputTransformerVAE,
+    ):
+        """Initialize the TransformerVAE with the specified encoder, decoder, decoder head, and input layer."""
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.decoder_head = decoder_head
+        self.input_layer = input_layer
+
+    def forward(
+        self,
+        counts: torch.Tensor,
+        genes: torch.Tensor,
+        library_size: torch.Tensor,
+        counts_subset: torch.Tensor | None = None,
+        genes_subset: torch.Tensor | None = None,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Forward pass through the VAE model, encoding the input counts and decoding to obtain the output parameters and latent representation."""
+        genes_counts_embedding = self.input_layer(
+            counts_subset,
+            genes_subset,
+        )  # B, S, E
+        h_z = self.encoder(genes_counts_embedding)  # B, M, E
+        genes_for_decoder = (
+            genes
+            if isinstance(self.decoder.gene_embedding, nn.Embedding)
+            else self.input_layer.gene_embedding(genes)
+        )  # B, S, E
+        h_x = self.decoder(h_z, genes_for_decoder)  # B, S, E
+        head_name = self.decoder_head.__class__.__name__
+        if head_name == "GaussianTransformerLayer":
+            mu = self.decoder_head(h_x, genes, library_size)
+            params = {"mu": mu}
+        else:
+            out: tuple[torch.Tensor, torch.Tensor] | torch.Tensor = self.decoder_head(
+                h_x, genes, library_size
+            )
+            if isinstance(out, tuple):
+                params = {"mu": out[0], "theta": out[1]}
+            else:
+                raise ValueError(f"Unsupported decoder_head output for {head_name}: {type(out)}")
+        return params, h_z
+
+    def encode(
+        self,
+        counts: torch.Tensor,
+        genes: torch.Tensor,
+        counts_subset: torch.Tensor | None = None,
+        genes_subset: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode the input counts and genes into the latent representation using the encoder and input layer."""
+        genes_counts_embedding = self.input_layer(
+            counts_subset if counts_subset is not None else counts,
+            genes_subset if genes_subset is not None else genes,
+        )
+        return self.encoder(genes_counts_embedding)
+
+    def decode(
+        self,
+        z: torch.Tensor,
+        genes: torch.Tensor,
+        library_size: torch.Tensor,
+        condition: dict[str, torch.Tensor] | None = None,
+    ) -> torch.distributions.Distribution:
+        """Decode the latent representation z into a distribution over the observed data using the decoder and decoder head."""
+        genes_for_decoder = (
+            genes
+            if isinstance(self.decoder.gene_embedding, nn.Embedding)
+            else self.input_layer.gene_embedding(genes)
+        )
+        h_x = self.decoder(z, genes_for_decoder, condition)
+        head_name = self.decoder_head.__class__.__name__
+        if head_name == "GaussianTransformerLayer":
+            mu = self.decoder_head(h_x, genes, library_size)
+            return Normal(mu, torch.ones_like(mu))
+        mu, theta = self.decoder_head(h_x, genes, library_size)
+        return NegativeBinomialSCVI(mu=mu, theta=theta)
+
+
+class ScviVAE(nn.Module):
+    """VAE model for single-cell data using SCVI-style encoder and decoder."""
+
+    def __init__(
+        self,
+        encoder: EncoderScvi,
+        encoder_head: GaussianLinearLayer,
+        decoder: DecoderScvi,
+        decoder_head: NegativeBinomialLinearLayer,
+        prior: Distribution,
+    ):
+        """Initialize the SCVI-style VAE with the specified encoder, encoder head, decoder, decoder head, and prior distribution."""
+        super().__init__()
+        self.encoder = encoder
+        self.encoder_head = encoder_head
+        self.decoder = decoder
+        self.decoder_head = decoder_head
+        self.prior = prior
+
+    def forward(
+        self,
+        counts: torch.Tensor,
+        genes: torch.Tensor,
+        library_size: torch.Tensor,
+        condition: dict[str, torch.Tensor] | None = None,
+        counts_subset: torch.Tensor | None = None,
+        genes_subset: torch.Tensor | None = None,
+        masking_prop: float = 0.0,
+        mask_token_idx: int = 0,
+    ) -> tuple[Distribution, Distribution, torch.Tensor]:
+        """Forward pass through the SCVI-style VAE, encoding the input counts and decoding to obtain the conditional likelihood, variational posterior, and latent representation."""
+        h_z, _ = self.encoder(counts)
+        variational_posterior = self.encoder_head(h_z)
+        loc = getattr(variational_posterior, "loc", None)
+        scale = getattr(variational_posterior, "scale", None)
+        if loc is not None and scale is not None:
+            eps = torch.randn_like(loc)
+            z = loc + eps * scale
+        else:
+            z = variational_posterior.rsample()
+        h_x = self.decoder(z)
+        conditional_likelihood = self.decoder_head(h_x, None, library_size)
+        return conditional_likelihood, variational_posterior, z
